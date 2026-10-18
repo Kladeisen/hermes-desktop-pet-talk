@@ -43,9 +43,10 @@ cancellation, control-channel teardown, redial and stale-completion isolation, c
 qualified read-back, and the UI polish.
 
 **Needs:** Hermes Desktop + Hermes Agent **0.22**, and the `codex` CLI logged in with a ChatGPT
-plan. Windows and macOS get voice, the in-app pet and quick reply; the plugin's own pet windows
-need Linux/Wayland (see [Windows and macOS](#windows-and-macos)). This is an unofficial build —
-see the banner above.
+plan. Windows and macOS get voice, the in-app pet, bot pets and quick reply; only the plugin's own
+**separate windows** — the pop-out pet and bot pets as desktop windows — need Linux/Wayland, and
+bot pets simply appear inside the Hermes window instead
+(see [Windows and macOS](#windows-and-macos)). This is an unofficial build — see the banner above.
 
 ## What the buttons do
 
