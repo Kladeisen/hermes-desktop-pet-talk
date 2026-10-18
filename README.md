@@ -21,8 +21,81 @@ for the voice lane.
 > developed and tested against **Hermes Agent 0.22.0** on Linux/Wayland. Expect rough edges;
 > read [Status & roadmap](#status--roadmap) before trusting it with a daily workflow.
 
+## What this is
+
+A Hermes Desktop plugin that does two things:
+
+**1. A voice you can talk to.** Full-duplex **Live Voice** — press the pet (or the composer
+button), talk, and the model answers out loud while showing a live transcript. Task requests
+from voice are delegated into the chat that was focused when the call started, so they run on
+your own models and providers. Three engines: **Codex Live** (default — ChatGPT/Codex
+subscription, no API key), **OpenAI Realtime**, and **Hermes Live** (your OpenAI key,
+~$0.05/min).
+
+**2. Pets that show what's happening.** Whatever pet is selected in Hermes gains state
+animation (**Working / Finished / Error / Idle**) plus a mic button, a transcript button and an
+optional always-on-top pop-out window. Each of your bots can also get its own **bot pet** with
+its own status, chat button and remembered position.
+
+Beyond upstream `hermes-live-voice` this build adds the desktop pet companion and its pop-out
+window, bot pets, follow-window bot selection, and the follow-up A–I fixes — mic-test
+cancellation, control-channel teardown, redial and stale-completion isolation, connection-
+qualified read-back, and the UI polish.
+
+**Needs:** Hermes Desktop + Hermes Agent **0.22**, and the `codex` CLI logged in with a ChatGPT
+plan. Windows and macOS get voice, the in-app pet and quick reply; the plugin's own pet windows
+need Linux/Wayland (see [Windows and macOS](#windows-and-macos)). This is an unofficial build —
+see the banner above.
+
+## What the buttons do
+
+### On the pet
+
+| Control | What it does |
+| --- | --- |
+| **Voice** — round button on the pet | `Start Live Voice` / `Stop Live Voice`. Opens or ends the call; voice talks to a chat, so open one first. |
+| **Mute** — small button above the voice button | `Mute microphone`. Only shown while a call is live, and it disappears when the call ends. |
+| **Transcript** — speech-bubble icon | `Open live transcript in Hermes`. Opens or closes the transcript panel in place, in the session the call is bound to; stays available after a call if it has content. |
+| **Pop-out** — arrow beside the transcript button | `Pop out pet` / `Close pop-out pet`. An always-on-top pet window *outside* Hermes. Linux/Wayland only — the button is hidden where it can't run, and Shift-clicking the pet then uses Hermes' own pop-out instead. |
+| **Status bubble** | `Working`, `Finished`, `Error`, `Idle`. Announced politely (`aria-live`) rather than repeatedly. |
+
+### In the composer and the status bar
+
+| Control | What it does |
+| --- | --- |
+| **Live Voice** — composer button | Same start/stop, plus a popover for microphone, output, chat handoff, mute, **Hang up Live Voice**, the microphone test and the voice engine. |
+| **🐾 Pets & voice** — status-bar button | Where the pet and voice settings actually live (its tooltip reports the current pet and bot-pet sizes). |
+| **Live transcript** — status-bar chip | Opens the live transcript. |
+| **Live badge** — status bar | Shows that a call is running. |
+
+### Bot pets
+
+Drag a bot pet to move it (the position is remembered). Click its chat bubble to open that
+bot's chat, and its **×** to dismiss it. Busy bots show a status line; each bot pet keeps its
+own size, set from the 🐾 panel.
+
+### Command palette
+
+`Talk Desktop: Pop out pet` · `Talk Desktop: Close pop-out pet` · `Talk Desktop: Show bot pet status`
+
+## Settings
+
+- **Pet size** and **bot pet size** sliders — sizes show in the panel while a pet is out.
+- **Show bot pets**, **Where bot pets appear** (`Automatic` / `Desktop windows` — Linux/Wayland
+  only — / `Inside Hermes`), and **Reset bot positions**.
+- **Bot status in the pet bubble** and **Show sub-agent progress in the pet bubble** — both off
+  by default. Hermes shows only the newest line, so with several busy bots they replace each
+  other; that is why they are off.
+- **Voice engine** — `Codex Live — ChatGPT subscription` (default), `OpenAI Realtime — API key or
+  Codex sign-in`, `Hermes Live — your OpenAI key (~$0.05/min)`. Applies to the next call.
+
+---
+
 ## Contents
 
+- [What this is](#what-this-is)
+- [What the buttons do](#what-the-buttons-do)
+- [Settings](#settings)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Install](#install)
