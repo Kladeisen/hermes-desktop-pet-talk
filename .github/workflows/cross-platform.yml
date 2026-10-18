@@ -1,0 +1,30 @@
+name: Cross-platform backend
+
+# Manual only: GitHub bills Windows minutes 2x and macOS 10x.
+# Proves the backend half imports and its portable paths work on Windows and macOS.
+# It cannot show how the pets look there; that needs a real machine.
+on:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test deps
+        run: pip install pytest fastapi httpx pillow
+      - name: Portable helpers, no-fcntl import, in-Hermes bot pet routes
+        run: python -m pytest -q tests/test_portable.py tests/test_broker_gallery.py tests/test_gallery_sprites.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Desktop plugin load harness
+        shell: bash
+        run: bash tools/plugin-load-test.sh

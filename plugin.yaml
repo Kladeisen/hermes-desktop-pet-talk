@@ -1,0 +1,13 @@
+name: talk-desktop
+python_dependencies: []
+# aiortc (Discord live voice lane only) is imported lazily; install it separately
+# if needed. Declaring it here blocks admission: aiortc 1.15 needs av<18, Hermes pins av 18.1.
+version: "0.2.3"
+requires_hermes: ">=0.22"
+author: Kladeisen
+provides_hooks:
+  - on_human_input_request
+  - on_human_input_resolved
+description: Desktop-pet-talk — desktop pet companion and full-duplex Live Voice for Hermes Desktop — Codex Live-1 (gpt-live-1) via the local
+  Codex app-server on a ChatGPT subscription, with live transcript, voice tools and task
+  delegation to the user's own agent. Optional gpt-realtime-2.1 lane.
