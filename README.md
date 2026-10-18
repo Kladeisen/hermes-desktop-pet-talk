@@ -177,6 +177,19 @@ This repo is **not in the curated plugin catalog**. The catalog entry named `her
 [upstream project](https://github.com/Synero/hermes-live-voice); installing that name gives you
 upstream, not this build.
 
+### Install checklist
+
+1. `hermes plugins install Kladeisen/hermes-desktop-pet-talk --force` — the community-source
+   scan blocks this one by default; read its output first (the note above explains why).
+2. `hermes plugins enable talk-desktop`.
+3. **Pick a pet mascot** — `hermes pets`, or Desktop → Settings → pet. This plugin ships no
+   artwork: the companion is whatever pet Hermes has selected, so with none selected you will
+   see no pet and the plugin looks broken.
+4. **Restart Hermes Desktop** so the app copies the desktop half into
+   `$HERMES_HOME/desktop-plugins/talk-desktop/`. The backend half mounts when Hermes starts.
+5. Check it loaded: `hermes plugins list | grep talk-desktop` shows it enabled, and no
+   `404 {"detail":"Plugin not found"}` box appears under the pet.
+
 ### Same-machine setup (manual)
 
 ```bash
