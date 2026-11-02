@@ -8,7 +8,7 @@ through the local **Codex app-server**, running on a **ChatGPT/Codex subscriptio
 for the voice lane.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-informational)](plugin.yaml)
+[![Version](https://img.shields.io/badge/version-0.3.1-informational)](plugin.yaml)
 [![Hermes](https://img.shields.io/badge/hermes-%E2%89%A50.22-informational)](plugin.yaml)
 [![Status: preview](https://img.shields.io/badge/status-preview-orange)](#status--roadmap)
 
@@ -17,7 +17,7 @@ for the voice lane.
 > **This repo is a personal extended build**, not the upstream project. It started from
 > [Synero/hermes-live-voice](https://github.com/Synero/hermes-live-voice) (MIT) and adds
 > desktop-pet controls, a plugin-owned native companion window, bot pets and a
-> cross-platform backend. Snapshot of `master` @ `67cd033` (remote-chat hosting merged),
+> cross-platform backend. Snapshot of `master` @ `fa704d0` (remote-chat hosting plus the native pop-out repair),
 > developed and tested against **Hermes Agent 0.22.5** on Linux/Wayland. Expect rough edges;
 > read [Status & roadmap](#status--roadmap) before trusting it with a daily workflow.
 
@@ -150,7 +150,7 @@ hermes plugins enable talk-desktop
 
 Verified verbatim on Hermes Agent 0.22.5: the install lands the whole tree in
 `$HERMES_HOME/plugins/talk-desktop`, byte-identical to this repo, and `hermes plugins list` then
-shows `talk-desktop 0.3.0 · git`.
+shows `talk-desktop 0.3.1 · git`.
 
 <details><summary>Why the scan blocks, and how to make it not block</summary>
 
@@ -342,6 +342,7 @@ If you would use one of these, please open an issue and say which server or prov
 
 ## Changelog
 
+- **0.3.1** — native pop-out repairs. The pet window's control rail no longer clips at the sprite rectangle: WebKitGTK's software canvas repaint was clipping the entire transparent page to the canvas damage rect, so the controls outside the canvas were cut off while DOM geometry, GTK allocation and WebKit snapshots all looked correct. The page is now sized to the viewport and re-invalidated on the existing animation tick (an opacity toggle of one 8-bit step — no extra timer, no geometry or layout change, no artwork change). Dragging works again when the helper runs under a systemd gateway that has the Wayland socket but no `HYPRLAND_INSTANCE_SIGNATURE`: `hyprctl` was failing outright there and the drag state stayed unset. The exact compositor is now discovered from `hyprctl instances` by matching the Wayland socket and a live same-user PID, and a missing or ambiguous match is refused rather than falling back to the first instance. Both repairs are checked against real compositor pixels, not WebKit snapshots, which stay green through the clipping bug (`tools/native-clipping-test.py`, needs a real Wayland desktop).
 - **0.3.0** — remote chats. Bot pets follow the **active connection** instead of only the local backend, so a chat on an SSH host gets that host's bots, statuses and chat buttons; both pet surfaces now draw here while the chat lives elsewhere (the pop-out is hosted by this machine and takes its sheet from the chat's backend, the bot windows go through a renderer-owned lease). New **Show Hermes pet** switch in the Pets & voice panel — a shortcut for Hermes' own pet setting, not a second visibility preference. Hosted-lifecycle fixes: a refused claim releases the in-app pet instead of leaving it gone, the local host is re-probed on an explicit pop-out (a fresh app may not have spawned its backend yet), a failed sheet fetch reports its reason and falls back to this machine's artwork, a full-size WebP sheet no longer trips the image cap, a pooled backend without `WAYLAND_DISPLAY` finds the compositor socket in the runtime dir, and the hosted poll only runs while a window is actually hosted.
 - **0.2.2** — identity and language polish, on top of community fixes by [@tillstriegel](https://github.com/tillstriegel) ([#4](https://github.com/Synero/hermes-live-voice/pull/4)): the voice identity prompt no longer hardcodes the owner's name, the model-facing voice context follows the session language (es/en), and — fixed here — the delegated-thread recovery path now keeps that language instead of silently recreating the thread in the fallback while the previous run was in the other language. Also: the transcript's user label is localized and owner-neutral rather than a hardcoded name, and the identity docstring no longer lists private bot names. **Why it matters:** the plugin runs on other people's machines, so no installer should ever see someone else's name in the prompt or in the UI.
 - **0.2.1** — audit fixes: the backend now imports its **bundled** `talk_vendor` fallback on fresh installs (previously it needed `hermes-talk` installed); a concurrent `/session` pair no longer deadlocks the event loop; app-server RPC correlation survives reader-buffer pruning; `/codexlive/interrupt` runs off the event loop; `CODEX_HOME` is honored consistently across login/backup/logout; when an older app-server drops `clientManagedHandoffs` the response now carries `droppedFields`/`handoffDegraded`/`warning` and the desktop shows a notice instead of failing silently; the desktop interrupt call sends a plain object body (no double-encoding) and a muted mic can no longer be un-muted by barge-in.
@@ -359,7 +360,7 @@ calls — stdlib + pytest only). CI additionally verifies the bundled fallback i
 clean environment (empty `HOME`, no site-packages), compiles the backend, syntax-checks the
 desktop half and runs the ESM load harness.
 
-**Snapshot status: 5 failed, 532 passed, 2 skipped** on Hermes Agent 0.22.5 / Linux, run through
+**Snapshot status: 5 failed, 544 passed, 1 skipped** on Hermes Agent 0.22.5 / Linux, run through
 the isolated runner (`TALK_TEST_SCRATCH=… tools/bot-pets-verify.sh python`). All five are inherited
 or environmental, not caused by publishing:
 

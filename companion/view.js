@@ -74,7 +74,7 @@
     paintBubble()
     layout()
   }
-  let counts=[],activeRow=-1,drawing=false,sheetSource=''
+  let counts=[],activeRow=-1,drawing=false,sheetSource='',paintEpoch=0
   sheet.onload=()=>{
     // Petdex v2 taxonomy, identical to Hermes PetSprite's named rows.
     // The manifest does not override geometry/counts: trim each row at its
@@ -107,6 +107,11 @@
       ctx.clearRect(0,0,192,208);ctx.drawImage(sheet,frame*192,row*208,192,208,0,0,192,208)
       const next=visibleBounds(pet)
       if(next && next!==controlBounds){controlBounds=next;layout()}
+      // WebKitGTK's software canvas repaint can clip the entire transparent page to
+      // the canvas damage rect. Invalidate the full body in the same animation tick.
+      // The sub-byte alpha difference is invisible; a separate epoch also covers
+      // one-frame rows. Reuse this timer rather than adding a background paint loop.
+      document.body.style.opacity=++paintEpoch%2?'0.999999':'1'
       frame=(frame+1)%count
       setTimeout(draw,1100/count)
     }

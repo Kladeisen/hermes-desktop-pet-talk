@@ -7,7 +7,36 @@ import subprocess
 
 
 def hypr(*args):
-    result = subprocess.run(['hyprctl', *args], capture_output=True, text=True, timeout=1, check=True)
+    env = os.environ.copy()
+    if not env.get('HYPRLAND_INSTANCE_SIGNATURE'):
+        # A systemd-owned gateway may have the Wayland socket but not the shell's
+        # compositor signature. Bind to that exact display, never the first instance.
+        display = env.get('WAYLAND_DISPLAY')
+        if not display:
+            raise RuntimeError('Wayland display unavailable')
+        found = subprocess.run(['hyprctl', '-j', 'instances'], capture_output=True,
+                               text=True, timeout=1, check=True)
+        instances = json.loads(found.stdout)
+        matches = []
+        for instance in instances if isinstance(instances, list) else []:
+            if not isinstance(instance, dict) or instance.get('wl_socket') != display:
+                continue
+            signature, pid = instance.get('instance'), instance.get('pid')
+            if not isinstance(signature, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', signature):
+                continue
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+                continue
+            try:
+                if Path('/proc', str(pid)).stat().st_uid != os.getuid():
+                    continue
+            except OSError:
+                continue
+            matches.append(signature)
+        if len(matches) != 1:
+            raise RuntimeError('Cannot identify the owning Wayland compositor')
+        env['HYPRLAND_INSTANCE_SIGNATURE'] = matches[0]
+    result = subprocess.run(['hyprctl', *args], capture_output=True, text=True,
+                            timeout=1, check=True, env=env)
     return result.stdout
 
 

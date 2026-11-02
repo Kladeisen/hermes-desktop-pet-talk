@@ -2,7 +2,7 @@ name: talk-desktop
 python_dependencies: []
 # aiortc (Discord live voice lane only) is imported lazily; install it separately
 # if needed. Declaring it here blocks admission: aiortc 1.15 needs av<18, Hermes pins av 18.1.
-version: "0.3.0"
+version: "0.3.1"
 requires_hermes: ">=0.22"
 author: Kladeisen
 provides_hooks:
