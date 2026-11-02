@@ -1876,11 +1876,15 @@ const petAtomGet = atom => { try { return atom?.get ? atom.get() : atom } catch 
 const petProfileKey = value => String(value ?? '').trim() || 'default'
 let petChat = null
 let petCompanion = { busy: false, open: false, error: '', toggle: () => {} }
-// Where bot pets appear. Desktop windows need Linux with a layer-shell compositor; the backend
-// reports that once as petCompanion.desktopWindows (undefined until known = old behaviour).
+// Where bot pets appear. Desktop windows need Linux with a layer-shell compositor AND must be
+// spawned by the backend on this machine: the helper is a child of the backend process, so any
+// other connection (SSH host, remote gateway) can only draw bot pets inside the Hermes window.
+// `petCompanion.desktopWindows` describes the backend's own system, never this screen.
 const KEY_BOT_PLACE = 'botPlacement.v1'   // 'auto' | 'desktop' | 'inapp'
 const KEY_BOT_LINES = 'botLines.v1'       // '1' = bot lines in Hermes' pet bubble (off by default)
 let petStorage = null
+const petBotConnection = () => String(petAtomGet(host.state.connectionId) || '')
+
 // Pets panel sizes in percent, 50-200, saved; 100% = Hermes' default pet scale 0.33 and today's
 // pop-out/bot look. The main-pet size drives Hermes' own display.pet.scale on the owner profile only.
 const KEY_PET_SIZE = 'petSize.v1', KEY_BOT_SIZE = 'botSize.v1'
@@ -1926,20 +1930,52 @@ function setPetSize(which, value, rpc = true) {
 }
 // Hermes' real main-pet scale on the owner route, read without writing. `edits` is the drag generation
 // at request time: a slider move while the read is in flight wins. `apply` may return false to drop it.
-function readMainPetSize(edits = petSizeEdits, apply = null) {
+function readMainPetSize(edits = petSizeEdits, apply = null, fail = null) {
   if (!petOwnerHere()) return
   Promise.resolve(host.request?.('pet.info.meta', { profile: petOwner })).then(meta => {
     if (!petOwnerHere() || (apply && apply(meta) === false)) return
     if (edits === petSizeEdits && meta?.enabled && typeof meta.scale === 'number' && meta.scale > 0) setPetSize('pet', meta.scale / 0.0033, false)
-  }).catch(() => {})
+  }).catch(() => fail?.())
 }
 const petBotPlacement = () => {
   const pref = petStorage?.get?.(KEY_BOT_PLACE) || 'auto'
-  return pref === 'inapp' || petCompanion.desktopWindows === false ? 'inapp' : 'desktop'
+  if (petBotConnection() === 'local') {
+    // The helper is a child of the backend process, so its windows land on the backend machine.
+    return pref === 'inapp' || petCompanion.desktopWindows === false ? 'inapp' : 'desktop'
+  }
+  // A remote chat still gets real windows: this machine's own backend hosts them and the
+  // renderer feeds it the roster and images (see installHostedBots).
+  return pref !== 'inapp' && petCompanion.hostWindows === true ? 'desktop' : 'inapp'
 }
 const petBotsOnDesktop = () => !!botTracker?.enabled() && petBotPlacement() === 'desktop'
-const petBotsInApp = () => !!botTracker?.enabled() && petBotPlacement() === 'inapp'
+const petBotsInApp = () => !!botTracker?.enabled() && petBotPlacement() === 'inapp' && petCompanion.inappBlocked !== true
 const petPopOutHint = 'Shift-click the pet to pop it out: this system uses Hermes\u2019 own pop-out'
+// The viewer's own backend, addressed explicitly. `ctx.rest` only ever reaches the ACTIVE
+// connection, so a chat on another machine needs the app's REST bridge with connectionId 'local'.
+const PET_HOST_PATH = '/api/plugins/talk-desktop', PET_HOST_PROFILE = 'default', HOST_POLL_MS = 2000
+let HOST_FETCH_MS = 8000  // a remote REST call that never settles must not stall the pop-out
+function petHostBridge(path, body, timeoutMs = 8000) {
+  const api = typeof window === 'undefined' ? null : window.hermesDesktop?.api
+  if (typeof api !== 'function') return Promise.reject(new Error('Desktop bridge unavailable'))
+  return api({ path: PET_HOST_PATH + path, method: 'POST', body, connectionId: 'local', profile: PET_HOST_PROFILE, timeoutMs })
+}
+function probeHostWindows() {
+  // Returns whether this machine's own backend can host: a fresh app may not have spawned one
+  // yet, so an explicit pop-out re-checks instead of trusting a load-time answer forever.
+  return petHostBridge('/companion/capabilities', {}, 8000).then(reply => {
+    try { petStorage?.set?.('hostProbe.v1', JSON.stringify({ at: Math.round(Date.now() / 1000), ...reply })) } catch {}
+    // `rendererHost` gates the remote shape: an older backend answers capabilities but cannot
+    // accept a renderer-owned lease, and guessing would leave the bot pets with no windows at all.
+    const next = reply?.desktopWindows === true && reply?.rendererHost === true
+    petCompanion.hostReason = String(reply?.reason || '').slice(0, 160)
+    if (next !== petCompanion.hostWindows) {
+      petCompanion.hostWindows = next
+      window.dispatchEvent(new CustomEvent('talk-desktop:companion'))
+      window.dispatchEvent(new CustomEvent('talk-desktop:bots'))
+    }
+    return next === true
+  }).catch(() => { petCompanion.hostWindows = false; return false })
+}
 function petSessionOptions(owner) {
   return { profile: owner.profile, intent: 'in-place', ...(owner.connection ? { route: { connectionId: owner.connection, profile: owner.profile, mode: owner.connection === 'local' ? 'local' : 'remote' } } : {}) }
 }
@@ -2012,8 +2048,9 @@ function PetLiveBadge() {
     popout.addEventListener('click', e => { e.stopPropagation(); if (!popout.disabled) void petCompanion.toggle() })
     const paintPopout = () => {
       popout.disabled = petCompanion.busy
-      // No desktop pop-out here (Windows, macOS, non-layer-shell Linux): Hermes' own one stays.
-      popout.style.display = petCompanion.desktopWindows === false ? 'none' : 'flex'
+      // No desktop pop-out here (Windows, macOS, non-layer-shell Linux) and no local host for a
+      // remote chat: Hermes' own pop-out stays available.
+      popout.style.display = petCompanion.desktopWindows === false && petCompanion.hostWindows !== true ? 'none' : 'flex'
       popout.title = petCompanion.open ? 'Close pop-out pet' : 'Pop out pet'
       popout.setAttribute('aria-label', popout.title)
       popout.setAttribute('aria-pressed', String(petCompanion.open))
@@ -2828,8 +2865,24 @@ function installCompanionTransport(ctx, controller) {
       if (lease && !disposed) timer = setTimeout(pulse,succeeded && acknowledgements.size ? 0 : 200)
     }
   }
+  // Windows for a chat on another connection are hosted here (installHostedBots); the local
+  // lease path below only ever owns a backend on this machine.
+  const hostedPopOut = () => String(petAtomGet(host.state.connectionId) || '') !== 'local' && petCompanion.hostWindows === true
   const launch = async (showPet = true, auto = false) => {
     if (disposed || launching) return
+    // The load-time probe can miss a backend that had not been spawned yet, so an explicit
+    // pop-out asks once more. Keep the call optional: the transport section also runs in
+    // harnesses that only provide the lease path.
+    const remoteRoute = (() => { try { return typeof petBotConnection === 'function' && petBotConnection() !== 'local' } catch { return false } })()
+    if (!hostedPopOut() && remoteRoute && petCompanion.open !== true && typeof probeHostWindows === 'function') await probeHostWindows()
+    if (hostedPopOut()) {
+      try { petStorage?.set?.('hostOpen.v1', JSON.stringify({ at: Math.round(Date.now() / 1000), showPet, host: petCompanion.hostWindows, conn: petBotConnection(), placement: petBotPlacement() })) } catch {}
+      // Record the intent only: a window that never appears must not hide the in-app pet.
+      update({ busy: false, error: '' })
+      petCompanion.wantPopOut = showPet
+      window.dispatchEvent(new CustomEvent('talk-desktop:bots'))
+      return
+    }
     if (!auto) cancel() // a new choice by the user replaces a pending recovery
     if (petCompanion.desktopWindows === false) {
       if (showPet) host.notify?.({ kind: 'info', message: petPopOutHint })
@@ -2887,6 +2940,12 @@ function installCompanionTransport(ctx, controller) {
     if (disposed) return
     cancel()
     petVisible = false; update({ open: false })
+    // The load-time probe can miss a backend that had not been spawned yet, so an explicit
+    // pop-out asks once more. Keep the call optional: the transport section also runs in
+    // harnesses that only provide the lease path.
+    const remoteRoute = (() => { try { return typeof petBotConnection === 'function' && petBotConnection() !== 'local' } catch { return false } })()
+    if (!hostedPopOut() && remoteRoute && petCompanion.open !== true && typeof probeHostWindows === 'function') await probeHostWindows()
+    if (hostedPopOut()) { petCompanion.wantPopOut = false; window.dispatchEvent(new CustomEvent('talk-desktop:bots')); return }
     // Record close intent even while claim/publication/launch is unresolved.
     if (launching) return
     if (petBotsOnDesktop() && lease) { await pulse(); return }
@@ -2992,6 +3051,10 @@ function createBotTracker(ctx, { now = () => Date.now() } = {}) {
   }
   const turns = new Map(), dismissed = new Set(), doneTimers = new Map()
   const changed = () => window.dispatchEvent(new CustomEvent('talk-desktop:state'))
+  // Bot pets follow the source the app is on. Every signal below belongs to that connection:
+  // profiles.list, public busy state and message stamps. A stamp from another connection is
+  // still refused, and an unstamped event still needs this exact captured owner.
+  const botConnection = () => { try { return String(host.state.connectionId?.get?.() ?? '') } catch { return '' } }
   const profileOf = event => String(event?.profile || event?.payload?.profile || '').trim() || 'default'
   const known = name => roster.some(bot => bot.name === name)
   const parse = reply => (Array.isArray(reply?.profiles) ? reply.profiles : [])
@@ -3005,12 +3068,13 @@ function createBotTracker(ctx, { now = () => Date.now() } = {}) {
       workerAt: Number(p.worker_session?.last_active) || 0
     }))
   const refresh = async () => {
-    if (disposed || fetching || host.state.connectionId?.get?.() !== 'local' || typeof host.request !== 'function') return
+    const connection = botConnection()
+    if (disposed || fetching || !connection || typeof host.request !== 'function') return
     fetching = true
     const revision = generation
     try {
       const next = parse(await host.request('profiles.list', {}))
-      if (!disposed && revision === generation && host.state.connectionId?.get?.() === 'local') {
+      if (!disposed && revision === generation && botConnection() === connection) {
         const different = JSON.stringify(next) !== JSON.stringify(roster)
         roster = next
         // Starts can race discovery. Retain them only for confirmed roster members.
@@ -3048,7 +3112,8 @@ function createBotTracker(ctx, { now = () => Date.now() } = {}) {
   // Only the public, connection-qualified focused owner can bind a runtime.
   // Never attribute the other entries in busyBySession to the focused profile.
   const reconcile = () => {
-    if (disposed || !enabled || host.state.connectionId?.get?.() !== 'local') return
+    const connection = botConnection()
+    if (disposed || !enabled || !connection) return
     const owner = host.state.focusedSessionOwner?.get?.()
     const id = host.state.focusedSessionId?.get?.(), stored = host.state.focusedStoredSessionId?.get?.()
     const previous = owners.get(id)
@@ -3056,8 +3121,8 @@ function createBotTracker(ctx, { now = () => Date.now() } = {}) {
       clearSession(previous.name, id)
       owners.set(id, null) // conflicting runtime is quarantined until the route resets
     }
-    if (owner?.connectionId && owner.connectionId !== 'local' && id && !owners.has(id)) owners.set(id, null)
-    if (owner?.connectionId === 'local' && known(owner.profile) && typeof id === 'string' && id && typeof stored === 'string' && stored && !owners.has(id)) {
+    if (owner?.connectionId && owner.connectionId !== connection && id && !owners.has(id)) owners.set(id, null)
+    if (owner?.connectionId === connection && known(owner.profile) && typeof id === 'string' && id && typeof stored === 'string' && stored && !owners.has(id)) {
       owners.set(id, { name: owner.profile, stored, connection: owner.connectionId, busy: false })
     }
     const busy = host.state.busyBySession?.get?.()
@@ -3085,16 +3150,17 @@ function createBotTracker(ctx, { now = () => Date.now() } = {}) {
   const offConnection = host.state.connectionId?.listen?.(resetRoute)
   const offProfile = host.state.profile?.listen?.(resetRoute)
   const eventKey = (event, phase) => {
-    if (disposed || !enabled || host.state.connectionId?.get?.() !== 'local') return null
+    const active = botConnection()
+    if (disposed || !enabled || !active) return null
     const connection = event?.connectionId || event?.connection_id
     const name = profileOf(event), id = String(event?.session_id || event?.sessionId || event?.payload?.session_id || '')
     const association = owners.get(id), focusedOwner = host.state.focusedSessionOwner?.get?.()
     const contradictsFocus = id === host.state.focusedSessionId?.get?.() &&
       (focusedOwner?.connectionId !== association?.connection || focusedOwner?.profile !== association?.name || host.state.focusedStoredSessionId?.get?.() !== association?.stored)
-    const owned = association?.connection === 'local' && association.name === name && !contradictsFocus
-    // A missing stamp is not local by default: require this exact captured
+    const owned = association?.connection === active && association.name === name && !contradictsFocus
+    // A missing stamp is not this connection by default: require this exact captured
     // runtime/profile owner. Explicit foreign stamps always fail closed.
-    if (connection !== 'local' && (connection || !owned)) { countEvent(phase, connection ? 'foreign-connection' : 'missing-connection'); return null }
+    if (connection !== active && (connection || !owned)) { countEvent(phase, connection ? 'foreign-connection' : 'missing-connection'); return null }
     // Keep bounded, exactly stamped starts while discovery is in flight. They
     // cannot expose a pet or chat route until profiles.list confirms membership.
     const discovering = fetching && name !== 'default' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(name) && (turns.has(name) || turns.size < BOT_MAX)
@@ -3108,7 +3174,7 @@ function createBotTracker(ctx, { now = () => Date.now() } = {}) {
     const outcome = event?.payload?.status
     if (!failed && !['complete', 'completed', 'error', 'failed', 'interrupted'].includes(outcome)) { countEvent('terminal', 'unknown-outcome'); return }
     const active = activeSessions.get(key.name), association = owners.get(key.id)
-    const owned = association?.connection === 'local' && association.name === key.name && !association.closed
+    const owned = association?.connection === botConnection() && association.name === key.name && !association.closed
     if (!active?.delete(key.id) && !owned) { countEvent('terminal', 'no-observed-start'); return }
     if (owned) {
       association.closed = true
@@ -3162,11 +3228,12 @@ function createBotTracker(ctx, { now = () => Date.now() } = {}) {
     dismiss: name => { if (known(name) && !dismissed.has(name)) { dismissed.add(name); changed() } },
     openChat: async name => {
       const bot = roster.find(item => item.name === name)
-      if (disposed || !enabled || dismissed.has(name) || host.state.connectionId?.get?.() !== 'local' || !bot?.chatId) throw new Error('Bot chat unavailable')
-      return host.openSession(bot.chatId, { profile: bot.name, intent: 'in-place', route: { connectionId: 'local', profile: bot.name, mode: 'local' } })
+      const connection = botConnection()
+      if (disposed || !enabled || dismissed.has(name) || !connection || !bot?.chatId) throw new Error('Bot chat unavailable')
+      return host.openSession(bot.chatId, { profile: bot.name, intent: 'in-place', route: { connectionId: connection, profile: bot.name, mode: connection === 'local' ? 'local' : 'remote' } })
     },
     refresh,
-    diagnostics: () => ({ enabled, discovering: fetching, local: host.state.connectionId?.get?.() === 'local', events: { ...eventCounts } }),
+    diagnostics: () => ({ enabled, discovering: fetching, connection: botConnection(), local: botConnection() === 'local', events: { ...eventCounts } }),
     // Palette check: what each bot pet would show right now, without opening windows.
     report: async () => {
       await refresh()
@@ -3247,22 +3314,66 @@ function PetsPanel({ ctx }) {
   useEffect(() => { const h = () => { setSizes({ ...petSizes }); setSizeErr(petSizeError) }; window.addEventListener('talk-desktop:sizes', h); return () => window.removeEventListener('talk-desktop:sizes', h) }, [])
   // Opening (or returning to the owner route) re-reads Hermes' scale, so an Alt+scroll or Settings → Pet
   // change shows here. A read that a slider move overtook is dropped: the user's latest choice wins.
-  const [, routeMoved] = useState(0)
-  useEffect(() => { const offs = [host.state.profile, host.state.connectionId].map(atom => atom?.listen?.(() => routeMoved(n => n + 1))); return () => offs.forEach(off => off?.()) }, [])
+  const [routeEpoch, routeMoved] = useState(0)
+  const mainToggle = useRef({ generation: 0, pending: false })
+  const [toggleBusy, setToggleBusy] = useState(false), [toggleErr, setToggleErr] = useState('')
+  useEffect(() => { const offs = [host.state.profile, host.state.connectionId].map(atom => atom?.listen?.(() => { mainToggle.current.generation++; mainToggle.current.pending = false; setToggleBusy(false); setMainOut(null); routeMoved(n => n + 1) })); return () => offs.forEach(off => off?.()) }, [])
   const ownerHere = petOwnerHere(), [mainOut, setMainOut] = useState(null)
   useEffect(() => {
     if (!open || !ownerHere) return
-    let live = true
-    readMainPetSize(petSizeEdits, meta => { if (!live) return false; if (typeof meta?.enabled === 'boolean') setMainOut(meta.enabled) })
-    return () => { live = false }
-  }, [open, ownerHere])
+    const refresh = () => {
+      if (mainToggle.current.pending || !petOwnerHere()) return
+      const generation = ++mainToggle.current.generation
+      const failed = () => { if (generation === mainToggle.current.generation && petOwnerHere()) { setMainOut(null); setToggleErr("Couldn't read the Hermes pet — reopen the panel to retry.") } }
+      readMainPetSize(petSizeEdits, meta => {
+        if (generation !== mainToggle.current.generation) return false
+        if (typeof meta?.enabled !== 'boolean') { failed(); return false }
+        setMainOut(meta.enabled); setToggleErr('')
+      }, failed)
+    }
+    setMainOut(null); setToggleErr(''); refresh()
+    const off = host.onEvent('pet.changed', refresh)
+    return () => { off?.(); mainToggle.current.generation++; mainToggle.current.pending = false; setToggleBusy(false) }
+  }, [open, ownerHere, routeEpoch])
+  // Mirror Settings, not a plugin-only visibility flag. Always re-read the saved artwork on enable.
+  const chooseMainPet = async on => {
+    if (!ownerHere || !petOwnerConn || !petOwnerHere() || mainOut === null || mainToggle.current.pending) return
+    const generation = ++mainToggle.current.generation
+    const current = () => generation === mainToggle.current.generation && petOwnerHere()
+    mainToggle.current.pending = true; setToggleBusy(true); setToggleErr('')
+    try {
+      let slug = ''
+      if (on) {
+        const gallery = await host.request('pet.gallery', { profile: petOwner, localOnly: true })
+        if (!current()) return
+        const installed = (gallery?.pets || []).filter(p => p.installed && typeof p.slug === 'string' && p.slug)
+        slug = gallery?.active || installed[0]?.slug || ''
+        if (!installed.some(p => p.slug === slug)) { setToggleErr('Choose an installed pet in Hermes Settings first.'); return }
+      }
+      const reply = await host.request(on ? 'pet.select' : 'pet.disable', { profile: petOwner, ...(on ? { slug } : {}) })
+      if (!current()) return
+      if (reply?.ok !== true) throw Error('Pet change refused')
+      setMainOut(null)
+      const meta = await host.request('pet.info.meta', { profile: petOwner })
+      if (!current()) return
+      if (typeof meta?.enabled !== 'boolean') throw Error('Pet status unavailable')
+      setMainOut(meta.enabled)
+      if (meta.enabled !== !!on) throw Error('Pet change not confirmed')
+    } catch {
+      if (current()) setToggleErr("Couldn't change the Hermes pet — reopen the panel to retry.")
+    } finally {
+      if (current()) { mainToggle.current.pending = false; setToggleBusy(false) }
+    }
+  }
   // Moved here from the voice gear: same keys, same effects.
   const [botPlace, setBotPlace] = useState(() => ctx.storage.get(KEY_BOT_PLACE) || 'auto')
   const [botLines, setBotLines] = useState(() => ctx.storage.get(KEY_BOT_LINES) === '1')
   const [narrate, setNarrate] = useState(() => (ctx.storage.get(KEY_NARRATE) || '1') !== '0')
   const [, repaint] = useState(0)
   useEffect(() => { const h = () => repaint(n => n + 1); for (const t of ['talk-desktop:companion', 'talk-desktop:state']) window.addEventListener(t, h); return () => { for (const t of ['talk-desktop:companion', 'talk-desktop:state']) window.removeEventListener(t, h) } }, [])
-  const noDesktopWindows = petCompanion.desktopWindows === false
+  const remoteBackend = petBotConnection() !== 'local'
+  // Off a local chat, desktop windows are still available when THIS machine's backend hosts them.
+  const noDesktopWindows = remoteBackend ? petCompanion.hostWindows !== true : petCompanion.desktopWindows === false
   const chooseBotPlace = value => {
     if (!['auto', 'desktop', 'inapp'].includes(value)) return
     setBotPlace(value); ctx.storage.set(KEY_BOT_PLACE, value); void petCompanion.syncBots?.()
@@ -3282,8 +3393,8 @@ function PetsPanel({ ctx }) {
   const chooseVoice = value => { setVoice(value); ctx.storage.set(KEY_VOICE, value) }
   const botsShowing = (botTracker?.bots() || []).length > 0
   const showPet = ownerHere && (mainOut !== false || !!petCompanion.open), showSizes = showPet || botsShowing
-  const toggle = (label, hint, checked, onChange) => jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 10 }, children: [
-    jsx(Switch, { 'aria-label': label, checked, onCheckedChange: onChange }),
+  const toggle = (label, hint, checked, onChange, disabled = false) => jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 10 }, children: [
+    jsx(Switch, { 'aria-label': label, checked, disabled, onCheckedChange: onChange }),
     jsxs('div', { style: { fontSize: 11.5, lineHeight: 1.3 }, children: [label, jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)' }, children: hint })] })
   ] })
   const muted = { fontSize: 10, color: 'var(--ui-text-tertiary, #a1a1aa)' }
@@ -3299,6 +3410,8 @@ function PetsPanel({ ctx }) {
       children: '\u{1F43E} Pets & voice' }) }),
     jsx(PopoverContent, { side: 'top', align: 'end', sideOffset: 8, style: { width: 290, maxHeight: 'var(--radix-popover-content-available-height)', overflowY: 'auto' }, children: jsxs('div', { style: { display: 'flex', flexDirection: 'column' }, children: [
       jsx('div', { style: { fontSize: 13, fontWeight: 700, marginBottom: 10, color: 'var(--foreground, #18181b)' }, children: 'Pets & voice' }),
+      toggle('Show Hermes pet', !petOwnerConn ? 'Connect to Hermes to change its pet.' : !ownerHere ? 'Switch to the ' + petOwner + ' profile to change its pet.' : toggleBusy ? 'Updating Hermes pet…' : 'Same as Hermes Settings. Bot pets, pop-out and voice are separate.', mainOut === true, chooseMainPet, !ownerHere || !petOwnerConn || mainOut === null || toggleBusy),
+      toggleErr && jsx('div', { role: 'alert', style: { fontSize: 10.5, color: 'var(--destructive, var(--foreground))', marginBottom: 8 }, children: toggleErr }),
       showPet && slider('pet', 'Pet'), botsShowing && slider('bots', 'Bot pets (all)'),
       (!ownerHere || !showSizes) && jsx('div', { style: { ...muted, marginBottom: 6 }, children: !ownerHere ? 'Pet size applies on the ' + petOwner + ' profile.' : 'Sizes show here while a pet is out.' }),
       showSizes && jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8 }, children: [
@@ -3314,7 +3427,11 @@ function PetsPanel({ ctx }) {
           jsx(SelectItem, { value: 'inapp', children: 'Inside Hermes' })
         ] })
       ] }),
-      jsx('div', { style: { ...muted, lineHeight: 1.3, margin: '4px 0 10px' }, children: noDesktopWindows
+      jsx('div', { style: { ...muted, lineHeight: 1.3, margin: '4px 0 10px' }, children: remoteBackend
+        ? petCompanion.hostWindows === true
+          ? 'Desktop windows open from this machine while the chat stays on the other connection; bot pets use them.'
+          : 'Desktop windows are spawned by the backend, so they need the local backend. On this connection bot pets appear inside Hermes.'
+        : noDesktopWindows
         ? 'Desktop windows are not available on this system, so bot pets appear inside Hermes.'
         : 'Automatic uses desktop windows where this system supports them, otherwise inside Hermes.' }),
       toggle('Bot status in the pet bubble', 'Off by default. With bot pets inside Hermes, also show the latest busy bot\u2019s step in Hermes\u2019 own pet bubble. Several busy bots replace each other there.', botLines,
@@ -3594,9 +3711,11 @@ function installInAppBots(ctx) {
     sayLines(shown)
     if (shown.some(bot => !feed[bot.id]) && Date.now() - lastPoll > 1000) void poll()
   }
-  let lastPoll = 0
+  let lastPoll = 0, feedFailures = 0
+  // Probe while blocked too, so a later reachable route brings the pets back on its own.
+  const feedNames = () => botTracker?.enabled() && petBotPlacement() === 'inapp' ? (botTracker?.bots() || []).map(bot => bot.id) : []
   const poll = async () => {
-    const names = petBotsInApp() ? (botTracker?.bots() || []).map(bot => bot.id) : []
+    const names = feedNames()
     if (disposed || fetching || !ctx.rest) return
     if (!names.length) { feed = {}; render(); return }
     fetching = true; lastPoll = Date.now()
@@ -3605,13 +3724,23 @@ function installInAppBots(ctx) {
       const bots = reply?.bots
       feed = bots && typeof bots === 'object' && !Array.isArray(bots) ? bots : {}
       for (const entry of Object.values(feed)) { fetchImage(entry?.avatarId); fetchImage(entry?.pet?.spriteId) }
-    } catch {} finally { fetching = false }
+      feedFailures = 0
+      if (petCompanion.inappBlocked) { petCompanion.inappBlocked = false; window.dispatchEvent(new CustomEvent('talk-desktop:state')) }
+    } catch {
+      // Pet routes answer loopback callers only. On a backend that refuses this client (a remote
+      // gateway rather than an SSH tunnel) label-only pets with no artwork would appear, so hide
+      // them after a few tries instead. A single odd poll must not blink them.
+      if (++feedFailures >= 3 && petCompanion.inappBlocked !== true) {
+        petCompanion.inappBlocked = true
+        window.dispatchEvent(new CustomEvent('talk-desktop:state'))
+      }
+    } finally { fetching = false }
     render()
   }
   const schedule = () => {
     clearTimeout(timer)
-    // Polls only while bot pets are shown inside Hermes; toggling or a placement change restarts it.
-    timer = disposed || !petBotsInApp() ? null : setTimeout(() => { void poll().finally(schedule) }, document.hidden ? BOT_INAPP_HIDDEN_POLL_MS : BOT_INAPP_POLL_MS)
+    // Polls only while bot pets are placed inside Hermes; toggling or a placement change restarts it.
+    timer = disposed || petBotPlacement() !== 'inapp' ? null : setTimeout(() => { void poll().finally(schedule) }, document.hidden ? BOT_INAPP_HIDDEN_POLL_MS : BOT_INAPP_POLL_MS)
   }
   const onBots = () => { void poll().finally(schedule) }
   petCompanion.resetBots = async () => {
@@ -3645,6 +3774,232 @@ function installInAppBots(ctx) {
   }
 }
 
+// ── Hosted bot windows (remote chat, windows on this machine) ─────────────
+// The chat lives on another connection, so its roster and images come from that backend; the
+// native helper can only be spawned by THIS machine's backend. The renderer therefore owns the
+// presentation and pushes it over the app bridge, and only bot windows are shown (no main pet).
+function installHostedBots(ctx) {
+  // Bounded local trace of the hosted lifecycle: a silent refusal is unreadable otherwise.
+  const trace = value => {
+    try {
+      const prior = JSON.parse(ctx.storage?.get?.('hostTrace.v1') || '[]')
+      const list = Array.isArray(prior) ? prior : []
+      list.push({ ...value, t: Math.round(Date.now() / 1000) })
+      ctx.storage?.set?.('hostTrace.v1', JSON.stringify(list.slice(-30)))
+    } catch {}
+  }
+  const hostUpdate = changes => {
+    Object.assign(petCompanion, changes)
+    window.dispatchEvent(new CustomEvent('talk-desktop:companion'))
+  }
+  let disposed = false, timer = null, lease = null, running = false, pumping = false, failures = 0, followUp = false
+  let sheet = { key: '', id: '' }  // chat route -> uploaded pet sheet id
+  const images = new Map(), uploaded = new Set(), rejected = new Set(), feed = {}, acks = new Map()
+  // wantPopOut is the intent, open means a window is up: the in-app pet only hides for the latter.
+  const hostedPet = () => !disposed && petCompanion.wantPopOut === true && petCompanion.hostWindows === true && petBotConnection() !== 'local'
+  const hostedBots = () => !disposed && !!botTracker?.enabled() && petBotConnection() !== 'local' && petBotPlacement() === 'desktop'
+  const hostedHere = () => hostedPet() || hostedBots()
+  const forget = () => {
+    lease = null; running = false; failures = 0; sheet.key = ''; sheet.id = ''
+    uploaded.clear(); images.clear(); rejected.clear(); acks.clear()
+    for (const name of Object.keys(feed)) delete feed[name]
+  }
+  // A hosted pop-out that never got a window must hand the in-app pet back, or the pet stays
+  // hidden behind a window that does not exist.
+  const standDown = () => {
+    const had = petCompanion.wantPopOut === true || petCompanion.open === true
+    if (had) trace({ ev: 'stand-down' })
+    const connection = petBotConnection()
+    // Only a known remote route owns these switches; a local (or unresolved) route is the local
+    // transport's business, and the in-app pop-out keeps its state there.
+    if (!connection || connection === 'local' || !had) return
+    petCompanion.wantPopOut = false
+    petCompanion.open = false
+    window.dispatchEvent(new CustomEvent('talk-desktop:companion'))
+  }
+  const release = async () => {
+    const current = lease
+    forget()
+    if (current) await petHostBridge('/companion/release', current).catch(() => {})
+    standDown()
+  }
+  const botState = () => (botTracker?.bots() || []).map(bot => {
+    const entry = feed[bot.id] || {}
+    const avatarId = typeof entry.avatarId === 'string' && uploaded.has(entry.avatarId) ? entry.avatarId : ''
+    const pet = entry.pet && uploaded.has(entry.pet.spriteId) ? entry.pet : null
+    return { id: bot.id, label: bot.label, status: bot.status, chat: !!bot.chat,
+      ...(bot.attention ? { attention: bot.attention } : {}),
+      ...(avatarId ? { avatarId } : {}), ...(pet ? { pet } : {}) }
+  })
+  // Same per-bot feed the in-window pets use, plus one upload per image id this broker has not seen.
+  const media = async names => {
+    let reply
+    try { reply = await ctx.rest('/companion/bots', { method: 'POST', body: { bots: names }, timeoutMs: 6000 }) } catch { return }
+    const bots = reply?.bots
+    if (!bots || typeof bots !== 'object' || Array.isArray(bots)) return
+    for (const name of Object.keys(feed)) if (!names.includes(name)) delete feed[name]
+    for (const name of names) feed[name] = bots[name] || {}
+    for (const entry of Object.values(feed)) {
+      for (const id of [entry?.avatarId, entry?.pet?.spriteId]) {
+        if (typeof id !== 'string' || !/^[0-9a-f]{64}$/.test(id) || uploaded.has(id) || rejected.has(id)) continue
+        let data = images.get(id)
+        if (!data) {
+          try { data = (await ctx.rest('/companion/image', { method: 'POST', body: { id }, timeoutMs: 15000 }))?.data } catch { continue }
+          if (typeof data !== 'string') continue
+          images.set(id, data)
+        }
+        try { await petHostBridge('/companion/host/image', { ...lease, id, data }, 20000); uploaded.add(id) }
+        catch { rejected.add(id) }
+      }
+    }
+  }
+  // The chat's own backend resolves the pet Hermes would show for its profile; this machine
+  // only draws it, so the sheet is fetched once per route and uploaded once per id.
+  const fetchSheet = (profile, viaBridge) => {
+    const request = viaBridge
+      ? petHostBridge('/companion/pet-sprite', { profile }, HOST_FETCH_MS)
+      : ctx.rest('/companion/pet-sprite', { method: 'POST', body: { profile }, timeoutMs: HOST_FETCH_MS })
+    return Promise.race([request, new Promise((_, reject) => setTimeout(() => reject(new Error('Pet sheet timed out')), HOST_FETCH_MS))])
+  }
+  const petSheetId = async () => {
+    const profile = petProfileKey(petAtomGet(host.state.profile))
+    const key = petBotConnection() + '|' + profile
+    if (sheet.key !== key) {
+      // The chat's own backend has the profile's pet; if that route is unavailable, this
+      // machine's copy is the same artwork for the usual single-pet setup.
+      for (const viaBridge of [false, true]) {
+        try {
+          const reply = await fetchSheet(profile, viaBridge)
+          if (typeof reply?.sprite === 'string' && typeof reply?.spriteId === 'string') {
+            images.set(reply.spriteId, reply.sprite); sheet.key = key; sheet.id = reply.spriteId
+            trace({ ev: 'sheet', via: viaBridge ? 'local' : 'chat', slug: String(reply.slug || '').slice(0, 24) })
+            break
+          }
+          trace({ ev: 'sheet-empty', via: viaBridge ? 'local' : 'chat' })
+        } catch (error) {
+          trace({ ev: 'sheet-failed', via: viaBridge ? 'local' : 'chat', why: String(error?.message || error).slice(0, 120) })
+        }
+      }
+    }
+    if (!sheet.id) return null
+    if (!uploaded.has(sheet.id)) {
+      const data = images.get(sheet.id)
+      if (!data) return null
+      try { await petHostBridge('/companion/host/image', { ...lease, id: sheet.id, data }, 20000); uploaded.add(sheet.id) }
+      catch { rejected.add(sheet.id); return null }
+    }
+    return sheet.id
+  }
+  const presentation = spriteId => {
+    const snap = liveController?.snapshot?.() || {}
+    return {
+      ...(snap.descriptor ? { descriptor: snap.descriptor } : {}),
+      lifecycle: snap.lifecycle || 'idle', status: snap.status || '',
+      bands: Array.isArray(snap.bands) ? snap.bands : [], capabilities: Array.isArray(snap.capabilities) ? snap.capabilities : [],
+      muted: !!snap.muted, petVisible: !!spriteId && petCompanion.wantPopOut === true, petSize: petSizes.pet, botSize: petSizes.bots, botReset: petBotReset,
+      botsEnabled: !!botTracker?.enabled(), bots: hostedBots() ? botState() : [],
+      ...(spriteId ? { pet: { spriteId } } : {}),
+      ...(snap.narration ? { narration: snap.narration } : {}),
+      ...(snap.attention ? { attention: snap.attention } : {})
+    }
+  }
+  const dispatch = async command => {
+    try {
+      if (command.action === 'botChat') { await botTracker?.openChat(String(command.bot || '')); return { id: command.id, ok: true } }
+      if (command.action === 'botDismiss') {
+        if (!botTracker?.showing(String(command.bot || ''))) throw new Error('Bot unavailable')
+        botTracker.dismiss(String(command.bot || '')); return { id: command.id, ok: true }
+      }
+      // start/stop/setMuted/chat/transcript/reply/hidePet/bots are the same owner actions the
+      // local transport runs, so the hosted windows drive the real controller either way.
+      await liveController.action(command)
+      return { id: command.id, ok: true }
+    } catch { return { id: command.id, ok: false, error: 'Unavailable' } }
+  }
+  const pump = async () => {
+    if (disposed || pumping) return
+    pumping = true
+    try {
+      if (!hostedHere()) {
+        if (lease || petCompanion.open === true) trace({ ev: 'idle', open: petCompanion.open, host: petCompanion.hostWindows })
+        if (lease) await release(); else standDown()
+        return
+      }
+      const connection = petBotConnection()
+      if (!lease) {
+        if (!connection || connection === 'local') return
+        try { lease = await petHostBridge('/companion/claim', { connection, profile: petProfileKey(petAtomGet(host.state.profile)), host: 'renderer' }) }
+        catch (error) {
+          // No window will exist: give the in-app pet back and say why, so a refused claim is
+          // visible instead of leaving a vanished pet.
+          const why = String(error?.message || 'Pop-out unavailable').replace(/^Error:\s*/, '').slice(0, 120)
+          trace({ ev: 'claim-failed', why })
+          await release()
+          hostUpdate({ error: why })
+          return
+        }
+        trace({ ev: 'claimed' })
+        failures = 0
+      }
+      const names = hostedBots() ? (botTracker?.bots() || []).map(bot => bot.id) : []
+      if (names.length) await media(names)
+      const wantPet = hostedPet()
+      const spriteId = wantPet ? await petSheetId() : null
+      // No sheet means this backend predates /companion/pet-sprite: say so instead of opening an
+      // empty window, and keep the bot pets working.
+      if (wantPet && !spriteId) {
+        hostUpdate({ error: 'The pop-out needs the updated backend \u2014 restart Hermes', open: false })
+        // A pop-out on its own has nothing to show without the sheet; bot windows may continue.
+        if (!hostedBots()) { await release(); return }
+      } else if (petCompanion.error && wantPet === false) hostUpdate({ error: '' })
+      const sent = [...acks.values()]
+      const reply = await petHostBridge('/companion/pulse', { ...lease, state: presentation(spriteId), acks: sent })
+      sent.forEach(ack => acks.delete(ack.id))
+      if (!running) {
+        running = true
+        await petHostBridge('/companion/launch', lease, 20000).then(r => {
+          trace({ ev: 'launch', running: r?.running === true, ready: r?.ready === true })
+          if (r?.running === true && hostedPet()) hostUpdate({ open: true, error: '' })
+        })
+          .catch(e => { running = false; trace({ ev: 'launch-failed', why: String(e?.message || e).slice(0, 120) }) })
+      }
+      let dispatched = false
+      for (const command of (reply?.commands || []).slice(0, 16)) {
+        if (acks.has(command.id)) { dispatched = true; continue }
+        trace({ ev: 'command', action: String(command.action || '') })
+        acks.set(command.id, await dispatch(command)); dispatched = true
+      }
+      // Acknowledge promptly instead of after the next idle poll.
+      if (dispatched) followUp = true
+      failures = 0
+    } catch (error) {
+      trace({ ev: 'pulse-failed', why: String(error?.message || error).slice(0, 140), n: failures + 1 })
+      if (++failures > 3) await release()
+    } finally { pumping = false }
+  }
+  const tick = () => { void pump().finally(schedule) }
+  const schedule = () => {
+    clearTimeout(timer)
+    if (disposed || !hostedHere()) { timer = null; return }
+    const delay = followUp ? 0 : HOST_POLL_MS
+    followUp = false
+    timer = setTimeout(tick, delay)
+  }
+  const reconcile = () => { if (!hostedHere()) { void release(); schedule(); return } schedule(); tick() }
+  window.addEventListener('talk-desktop:state', reconcile)
+  window.addEventListener('talk-desktop:bots', reconcile)
+  window.addEventListener('talk-desktop:companion', reconcile)
+  probeHostWindows()
+  schedule(); tick()
+  return () => {
+    disposed = true; clearTimeout(timer)
+    window.removeEventListener('talk-desktop:state', reconcile)
+    window.removeEventListener('talk-desktop:bots', reconcile)
+    window.removeEventListener('talk-desktop:companion', reconcile)
+    void release()
+  }
+}
+
 // ── Contribution registration ────────────────────────────────────────────
 
 export default {
@@ -3667,6 +4022,7 @@ export default {
     const narrator = createWorkNarrator(ctx)
     ctx.onDispose?.(narrator.dispose)
     ctx.onDispose?.(installInAppBots(ctx))
+    ctx.onDispose?.(installHostedBots(ctx))
     ctx.register({ id: 'pet-live-badge', area: 'statusBar.right', render: () => jsx(PetLiveBadge, {}) })
     ctx.register({ id: 'companion-transcript', area: 'statusBar.right', render: () => jsx(CompanionTranscript, {}) })
     ctx.register({ id: 'pets-panel', area: 'statusBar.right', render: () => jsx(PetsPanel, { ctx }) })

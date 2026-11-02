@@ -212,3 +212,197 @@ def test_attention_is_a_bounded_kind_and_count_only():
         with pytest.raises(HTTPException) as error:broker.pulse({**owner,'state':{**state,'attention':bad}})
         assert error.value.status_code==400
     broker.close()
+
+
+# ── Renderer-hosted windows: a chat on another connection, windows on this machine ──────────
+
+def hosted_fixture():
+    m = load()
+    broker = m.Broker(ROOT)
+    owner = broker.claim({'profile': 'deepseek-thinkpad', 'connection': 'hermes-thinkpad', 'host': 'renderer'})
+    return m, broker, owner
+
+
+def hosted_state(bots, **extra):
+    state = {'lifecycle': 'idle', 'capabilities': [], 'status': '', 'bands': [], 'muted': False,
+             'petVisible': False, 'botsEnabled': True, 'bots': bots}
+    state.update(extra)
+    return state
+
+
+AVATAR = 'data:image/png;base64,' + 'QVZBVEFS'
+SHEET = 'data:image/webp;base64,' + 'U0hFRVQ'
+AID, SID = 'a' * 64, 'b' * 64
+PET = {'spriteId': SID, 'frameWidth': 192, 'frameHeight': 208, 'counts': [6, 8, 8, 4, 5, 8, 6, 6, 6], 'top': 20}
+
+
+def upload(broker, owner, ident, data):
+    return broker.host_image({**owner, 'id': ident, 'data': data})
+
+
+def test_hosted_claim_needs_a_remote_connection_and_leaves_the_local_rule_intact():
+    import pytest
+    m = load(); broker = m.Broker(ROOT)
+    with pytest.raises(Exception):
+        broker.claim({'profile': 'default', 'connection': 'local', 'host': 'renderer'})
+    with pytest.raises(Exception):
+        broker.claim({'profile': 'default', 'host': 'renderer'})
+    owner = broker.claim({'profile': 'deepseek-thinkpad', 'connection': 'hermes-thinkpad', 'host': 'renderer'})
+    assert broker.hosted() is True
+    assert broker.owner['connection'] == 'hermes-thinkpad' and broker.owner['profile'] == 'deepseek-thinkpad'
+    broker.close()
+    # The backend-owned path still refuses a remote route.
+    other = m.Broker(ROOT)
+    with pytest.raises(Exception):
+        other.claim({'profile': 'default', 'connection': 'hermes-thinkpad'})
+    other.close()
+
+
+def test_hosted_pulse_accepts_a_remote_roster_with_renderer_images():
+    m, broker, owner = hosted_fixture()
+    try:
+        upload(broker, owner, AID, AVATAR)
+        upload(broker, owner, SID, SHEET)
+        bots = [{'id': 'deepseek-thinkpad', 'label': 'DeepSeek', 'status': 'Working', 'chat': True,
+                 'avatarId': AID, 'pet': PET}]
+        broker.pulse({**owner, 'state': hosted_state(bots)})
+        state = broker.helper_state()
+        [bot] = state['state']['bots']
+        assert bot['id'] == 'deepseek-thinkpad' and bot['status'] == 'Working'
+        assert bot['avatar'] == AVATAR, 'the renderer image is what the helper draws'
+        assert bot['pet'] == PET, 'the sheet travels by id, fetched once through /sprite'
+        assert 'pet' not in state['state'], 'no main pet for a remote chat'
+        assert broker.sprite_data({'id': SID})['sprite'] == SHEET
+    finally:
+        broker.close()
+
+
+def test_hosted_roster_rejects_unknown_images_and_unsafe_descriptors():
+    import pytest
+    m, broker, owner = hosted_fixture()
+    try:
+        with pytest.raises(Exception):
+            broker.pulse({**owner, 'state': hosted_state([{'id': 'alpha', 'label': 'A', 'status': '', 'chat': False, 'avatarId': 'c' * 64}])})
+        upload(broker, owner, SID, SHEET)
+        with pytest.raises(Exception):
+            broker.pulse({**owner, 'state': hosted_state([{'id': 'alpha', 'label': 'A', 'status': '', 'chat': False,
+                                                           'pet': {**PET, 'counts': [0]}}])})
+        with pytest.raises(Exception):
+            broker.pulse({**owner, 'state': hosted_state([{'id': 'Bad Name', 'label': 'A', 'status': '', 'chat': False}])})
+        with pytest.raises(Exception):
+            broker.host_image({**owner, 'id': 'nothex', 'data': AVATAR})
+        with pytest.raises(Exception):
+            broker.host_image({**owner, 'id': AID, 'data': 'https://example.test/x.png'})
+        with pytest.raises(Exception):
+            broker.host_image({**owner, 'id': AID, 'data': 'data:image/png;base64,' + 'A' * 12_000_000})
+        with pytest.raises(Exception):
+            broker.host_image({'id': AID, 'data': AVATAR, 'token': 'wrong', 'generation': owner['generation']})
+    finally:
+        broker.close()
+
+
+def test_hosted_bot_command_skips_the_local_profile_lookup():
+    import pytest
+    m, broker, owner = hosted_fixture()
+    try:
+        bots = [{'id': 'deepseek-thinkpad', 'label': 'DeepSeek', 'status': '', 'chat': True}]
+        broker.pulse({**owner, 'state': hosted_state(bots)})
+        # This bot profile exists only on the chat's backend, so a local profile lookup would raise.
+        reply = broker.command({'generation': owner['generation'], 'id': 'bot-chat-0001', 'action': 'botChat', 'bot': 'deepseek-thinkpad'})
+        assert reply.get('duplicate') is not True
+        with pytest.raises(Exception):
+            broker.command({'generation': owner['generation'], 'id': 'bot-chat-0002', 'action': 'botChat', 'bot': 'unknown-bot'})
+    finally:
+        broker.close()
+
+
+def test_pet_sprite_serves_the_sheet_hermes_would_show_for_a_profile(monkeypatch, tmp_path):
+    from PIL import Image
+    import pytest
+    home = tmp_path / 'home'
+    (home / 'profiles').mkdir(parents=True)
+    (home / 'pets' / 'demo').mkdir(parents=True)
+    Image.new('RGBA', (192, 1872), (200, 30, 60, 255)).save(home / 'pets' / 'demo' / 'spritesheet.png')
+    m = load()
+    monkeypatch.setattr(m.portable, 'hermes_root', lambda: home)
+    broker = m.Broker(ROOT)
+    try:
+        reply = broker.pet_sheet('default')
+        assert reply['slug'] == 'demo'
+        assert reply['sprite'].startswith('data:image/png;base64,')
+        assert len(reply['spriteId']) == 64
+        assert broker.sprite_data({'id': reply['spriteId']})['sprite'] == reply['sprite'], 'fetched once by id'
+        with pytest.raises(Exception):
+            broker.pet_sheet('Bad Name')
+        with pytest.raises(Exception):
+            broker.pet_sheet('nobody')
+        (home / 'pets' / 'demo' / 'spritesheet.png').unlink()
+        with pytest.raises(Exception):
+            broker.pet_sheet('default')
+    finally:
+        broker.close()
+
+
+def test_hosted_lease_may_publish_the_main_pet_sheet():
+    import pytest
+    m, broker, owner = hosted_fixture()
+    try:
+        upload(broker, owner, SID, SHEET)
+        bots = [{'id': 'deepseek-thinkpad', 'label': 'DeepSeek', 'status': '', 'chat': False}]
+        broker.pulse({**owner, 'state': hosted_state(bots, petVisible=True, pet={'spriteId': SID},
+                                                     owner={'runtimeId': 'r1', 'storedId': 's1', 'profile': 'deepseek-thinkpad', 'connection': 'hermes-thinkpad'})})
+        state = broker.helper_state()['state']
+        assert state['pet'] == {'spriteId': SID}, 'the hosted pop-out draws the chat profile pet'
+        assert state['petVisible'] is True
+        assert state['owner']['connection'] == 'hermes-thinkpad'
+        with pytest.raises(Exception):
+            broker.pulse({**owner, 'state': hosted_state(bots, pet={'spriteId': 'd' * 64})})
+        with pytest.raises(Exception):
+            broker.pulse({**owner, 'state': hosted_state(bots, owner={'runtimeId': 'r1', 'storedId': 's1', 'profile': 'deepseek-thinkpad', 'connection': 'local'})})
+    finally:
+        broker.close()
+    # A backend-owned local lease still refuses a transport-supplied sheet.
+    local = m.Broker(ROOT)
+    try:
+        own = local.claim({'profile': 'default', 'connection': 'local'})
+        with pytest.raises(Exception):
+            local.pulse({**own, 'state': {'lifecycle': 'idle', 'capabilities': [], 'status': '', 'bands': [], 'muted': False, 'pet': {'spriteId': 'a' * 64}}})
+    finally:
+        local.close()
+
+
+def test_hosted_image_cap_fits_a_full_sheet_and_still_refuses_oversize():
+    import pytest
+    m, broker, owner = hosted_fixture()
+    try:
+        big = 'data:image/webp;base64,' + 'B' * 3_000_000   # ~2.2 MiB sheet after inflation
+        assert upload(broker, owner, SID, big)['ok'] is True
+        assert broker.sprite_data({'id': SID})['sprite'] == big
+        with pytest.raises(Exception) as denied:
+            upload(broker, owner, AID, 'data:image/webp;base64,' + 'C' * 12_000_000)
+        assert 'Image too large' in str(denied.value)
+    finally:
+        broker.close()
+
+
+def test_capabilities_finds_the_session_socket_when_the_env_var_is_missing(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / 'run'
+    runtime_dir.mkdir()
+    (runtime_dir / 'wayland-1').write_text('')       # the socket's name is all we look for
+    (runtime_dir / 'wayland-1.lock').write_text('')  # the lock must never be chosen
+    m = load()
+    monkeypatch.delenv('WAYLAND_DISPLAY', raising=False)
+    monkeypatch.setenv('XDG_RUNTIME_DIR', str(runtime_dir))
+    assert m.wayland_display() == 'wayland-1'
+    reply = m.Broker(ROOT).capabilities()
+    assert reply['rendererHost'] is True
+    import os.path
+    assert reply['desktopWindows'] is os.path.exists('/usr/bin/python')
+    monkeypatch.setenv('WAYLAND_DISPLAY', 'wayland-9')
+    assert m.wayland_display() == 'wayland-9'
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    monkeypatch.delenv('WAYLAND_DISPLAY', raising=False)
+    monkeypatch.setenv('XDG_RUNTIME_DIR', str(empty))
+    assert m.wayland_display() == ''
+    assert m.Broker(ROOT).capabilities()['desktopWindows'] is False

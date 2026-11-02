@@ -8,7 +8,7 @@ through the local **Codex app-server**, running on a **ChatGPT/Codex subscriptio
 for the voice lane.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.3-informational)](plugin.yaml)
+[![Version](https://img.shields.io/badge/version-0.3.0-informational)](plugin.yaml)
 [![Hermes](https://img.shields.io/badge/hermes-%E2%89%A50.22-informational)](plugin.yaml)
 [![Status: preview](https://img.shields.io/badge/status-preview-orange)](#status--roadmap)
 
@@ -17,8 +17,8 @@ for the voice lane.
 > **This repo is a personal extended build**, not the upstream project. It started from
 > [Synero/hermes-live-voice](https://github.com/Synero/hermes-live-voice) (MIT) and adds
 > desktop-pet controls, a plugin-owned native companion window, bot pets and a
-> cross-platform backend. Snapshot of `master` @ `c7ece17` (follow-up lanes A–I merged),
-> developed and tested against **Hermes Agent 0.22.0** on Linux/Wayland. Expect rough edges;
+> cross-platform backend. Snapshot of `master` @ `67cd033` (remote-chat hosting merged),
+> developed and tested against **Hermes Agent 0.22.5** on Linux/Wayland. Expect rough edges;
 > read [Status & roadmap](#status--roadmap) before trusting it with a daily workflow.
 
 ## What this is
@@ -120,10 +120,11 @@ own size, set from the 🐾 panel.
 - 🛠️ **Tools from voice** — the model can run tasks: by default they are delegated into the **exact chat captured when voice starts**, i.e. your own agent with **your** models and providers. A voice-side delegation policy keeps this clean (only real task requests are delegated, fillers stay conversational) and an internal queue prevents overlapping runs. An opt-in server-agent mode also exists.
 - 🎚️ **Audio & call controls** — device pickers, built-in mic test, one-tap **mute** and hang-up right in the composer.
 - 📊 **Usage panels** — measured voice minutes (rolling windows) and the Codex plan bucket.
+- 🖥️ **Works on remote chats** — bot pets follow the connection you are on (SSH host, remote gateway), and the pop-out pet is hosted by the machine you are looking at while the chat lives elsewhere.
 
 ## Requirements
 
-- **Hermes Agent** (backend) and **Hermes Desktop** (app) — tested with **0.22.0**.
+- **Hermes Agent** (backend) and **Hermes Desktop** (app) — tested with **0.22.5**.
 - **`codex` CLI ≥ 0.154**, logged in with a ChatGPT plan (`codex login` — device auth).
   This is the default `codex` voice engine and needs a ChatGPT/Codex subscription, not an API key.
 - Python 3.11+ for the backend half.
@@ -147,9 +148,9 @@ hermes plugins install Kladeisen/hermes-desktop-pet-talk --force
 hermes plugins enable talk-desktop
 ```
 
-Verified verbatim on Hermes Agent 0.22.0: the install lands the whole tree in
+Verified verbatim on Hermes Agent 0.22.5: the install lands the whole tree in
 `$HERMES_HOME/plugins/talk-desktop`, byte-identical to this repo, and `hermes plugins list` then
-shows `talk-desktop 0.2.3 · git`.
+shows `talk-desktop 0.3.0 · git`.
 
 <details><summary>Why the scan blocks, and how to make it not block</summary>
 
@@ -229,6 +230,15 @@ authorization, managed dependency installation, testing and limitations.
 
 ## Configuration
 
+### Quick pet on/off
+
+Open **🐾 Pets & voice** in the status bar and use **Show Hermes pet**. This is a shortcut
+for Hermes' own pet setting, not a second plugin visibility preference: Off keeps the saved
+artwork, and On restores that installed pet (or the first installed pet if no choice was saved).
+The switch stays available when the pet is hidden. It applies only on the plugin's owner
+connection/profile and confirms changes by reading Hermes' state back. Bot pets, the plugin's
+separate pop-out and live voice are unchanged. Pet selection and roaming remain in Hermes Settings.
+
 `settings.json` is stored next to the installed backend plugin
 (`$HERMES_HOME/plugins/talk-desktop/settings.json`). See `settings.example.json`:
 
@@ -286,7 +296,7 @@ Full engineering recipe, protocol tables and gotchas:
 
 ## Status & roadmap
 
-⚠️ **Preview (0.2.x).** The backend resolves its voice plumbing at import time in this order: the
+⚠️ **Preview (0.3.x).** The backend resolves its voice plumbing at import time in this order: the
 full [`hermes-talk`](https://github.com/TheSmokeDev/hermes-talk) plugin when it is installed (richer
 — native voice tools, run steering, cascade modes), otherwise the MIT-licensed fallback bundled in
 `dashboard/talk_vendor/`, so a fresh install with no other plugin mounts correctly (covered by a
@@ -332,6 +342,7 @@ If you would use one of these, please open an issue and say which server or prov
 
 ## Changelog
 
+- **0.3.0** — remote chats. Bot pets follow the **active connection** instead of only the local backend, so a chat on an SSH host gets that host's bots, statuses and chat buttons; both pet surfaces now draw here while the chat lives elsewhere (the pop-out is hosted by this machine and takes its sheet from the chat's backend, the bot windows go through a renderer-owned lease). New **Show Hermes pet** switch in the Pets & voice panel — a shortcut for Hermes' own pet setting, not a second visibility preference. Hosted-lifecycle fixes: a refused claim releases the in-app pet instead of leaving it gone, the local host is re-probed on an explicit pop-out (a fresh app may not have spawned its backend yet), a failed sheet fetch reports its reason and falls back to this machine's artwork, a full-size WebP sheet no longer trips the image cap, a pooled backend without `WAYLAND_DISPLAY` finds the compositor socket in the runtime dir, and the hosted poll only runs while a window is actually hosted.
 - **0.2.2** — identity and language polish, on top of community fixes by [@tillstriegel](https://github.com/tillstriegel) ([#4](https://github.com/Synero/hermes-live-voice/pull/4)): the voice identity prompt no longer hardcodes the owner's name, the model-facing voice context follows the session language (es/en), and — fixed here — the delegated-thread recovery path now keeps that language instead of silently recreating the thread in the fallback while the previous run was in the other language. Also: the transcript's user label is localized and owner-neutral rather than a hardcoded name, and the identity docstring no longer lists private bot names. **Why it matters:** the plugin runs on other people's machines, so no installer should ever see someone else's name in the prompt or in the UI.
 - **0.2.1** — audit fixes: the backend now imports its **bundled** `talk_vendor` fallback on fresh installs (previously it needed `hermes-talk` installed); a concurrent `/session` pair no longer deadlocks the event loop; app-server RPC correlation survives reader-buffer pruning; `/codexlive/interrupt` runs off the event loop; `CODEX_HOME` is honored consistently across login/backup/logout; when an older app-server drops `clientManagedHandoffs` the response now carries `droppedFields`/`handoffDegraded`/`warning` and the desktop shows a notice instead of failing silently; the desktop interrupt call sends a plain object body (no double-encoding) and a muted mic can no longer be un-muted by barge-in.
 - **0.2.0** — call controls (mute button, hover states) + delegation hardening: voice-side delegation policy, TTS-friendly reply note, filler filter, task queue, and neutralized background thread turns (the Codex plan no longer pays for invisible tool work).
@@ -348,13 +359,19 @@ calls — stdlib + pytest only). CI additionally verifies the bundled fallback i
 clean environment (empty `HOME`, no site-packages), compiles the backend, syntax-checks the
 desktop half and runs the ESM load harness.
 
-**Snapshot status: two tests are expected to fail here** (four parametrized cases), so CI is red
-until they are fixed — both failures are inherited, not caused by publishing:
+**Snapshot status: 5 failed, 532 passed, 2 skipped** on Hermes Agent 0.22.5 / Linux, run through
+the isolated runner (`TALK_TEST_SCRATCH=… tools/bot-pets-verify.sh python`). All five are inherited
+or environmental, not caused by publishing:
 
 | Test | Why |
 |---|---|
-| `tests/test_model_context.py::test_desktop_model_messages` | still expects the old hardcoded `[voice] Reply briefly and naturally in English…` prefix, while the plugin now follows the session language (0.2.2 change). Stale test, intended behaviour. |
+| `tests/test_model_context.py::test_desktop_model_messages` (3 locales) | still expects the old hardcoded `[voice] Reply briefly and naturally in English…` prefix, while the plugin now follows the session language (0.2.2 change). Stale test, intended behaviour. |
 | `tests/test_discord_live.py::test_discord_media_dependency_is_declared_for_managed_installation` | asserts `plugin.yaml` declares `aiortc`; it deliberately does not (declaring it blocks admission — see the manifest comment). |
+| `tests/test_broker_gallery.py::test_capabilities_report_desktop_windows_only_on_linux_layer_shell` | fails only on a real Wayland desktop: it unsets `WAYLAND_DISPLAY` and expects `desktopWindows: false`, while 0.3.0 also finds the compositor socket in `XDG_RUNTIME_DIR`. Passes on a headless runner. |
+
+The Node suites are separate: `tools/bot-pets-verify.sh js` needs `TALK_TEST_DEPS` pointing at an
+installed `node_modules` with React, jsdom and `playwright-core`; `tests/bot-bubble-layout.mjs` is a
+Chromium layout test that the JS runner does not include.
 
 Installing therefore needs `--force`: the community-source scan and `hermes plugins validate` both
 report the private-core imports and the deliberate app-DOM reach this plugin relies on.
@@ -411,8 +428,37 @@ Where they can't run:
   replace each other; that is why it is off.
 
 Settings → Bot pets chooses **Automatic** (desktop windows where supported,
-otherwise inside Hermes), **Desktop windows** or **Inside Hermes**, and turns the
+otherwise inside Hermes — a remote backend always counts as "otherwise"),
+**Desktop windows** or **Inside Hermes**, and turns the
 bubble lines on (off by default).
+
+### Remote backends (SSH host, remote gateway)
+
+Bot pets are not limited to the local backend. The roster, busy state and message
+stamps all come from the connection the app is on, so a chat on an SSH host gets
+that host's bots, their statuses and working chat buttons.
+
+The pop-out pet uses the same path: on a remote chat the plugin's own external pet (sprite,
+controls, status box, quick reply) is hosted here too, driven by this renderer's live
+controller, while its sheet comes from the chat's own backend (`POST /companion/pet-sprite`).
+
+They also get real desktop windows, hosted by **this** machine: the renderer owns
+the presentation (roster, statuses, sprites fetched once by id from the chat's own
+backend) and pushes it to the local plugin backend over the desktop REST bridge
+with `connectionId: 'local'`, which spawns the native helper as usual. Only the bot
+windows appear there — no main pet, no microphone, no second session — and a bot's
+chat button opens its chat on the connection it came from. The local half
+advertises this through `rendererHost` in `POST /companion/capabilities`; against an
+older backend, or when the local half cannot host windows, the pets fall back
+inside the Hermes window.
+
+The pet routes answer loopback callers only. An SSH connection tunnels to the
+remote backend's loopback, so discovery and the `POST /companion/bots` feed both
+work. A remote gateway reached over HTTPS through a proxy is refused instead: the
+in-app pets hide themselves after three failed polls rather than drawing empty
+frames. The pop-out pet is not affected by that rule the same way: the chat's own
+backend only supplies the sheet, this machine's backend draws the window, and a
+failed fetch falls back to this machine's copy of the profile's pet.
 
 The backend avoids POSIX-only calls outside the Linux window code
 (`dashboard/portable.py`): no `fcntl` import, no `os.kill(pid, 0)` (on Windows

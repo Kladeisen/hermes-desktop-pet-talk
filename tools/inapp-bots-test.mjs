@@ -9,24 +9,32 @@ const require = createRequire(`${process.env.TALK_TEST_DEPS}/../package.json`)
 const { JSDOM } = require('jsdom')
 const source = readFileSync(process.env.TALK_TEST_PLUGIN || new URL('../desktop/plugin.js', import.meta.url), 'utf8')
 const ID = c => c.repeat(64)
-const IMAGES = { [ID('a')]: 'data:image/png;base64,QVZBVEFS', [ID('b')]: 'data:image/webp;base64,U0hFRVQ=' }
+const IMAGES = { [ID('a')]: 'data:image/png;base64,QVZBVEFS', [ID('b')]: 'data:image/webp;base64,U0hFRVQ=', [ID('c')]: 'data:image/webp;base64,UElQUE1BSU4=' }
 
-async function setup({ desktopWindows = false, store = {}, progress = null, roster, viewport = [1024, 768] } = {}) {
+async function setup({ desktopWindows = false, store = {}, progress = null, roster, viewport = [1024, 768], connection = 'local', bridge = null, failPetSprite = false, hangPetSprite = false } = {}) {
   const dom = new JSDOM('<body></body>', { url: 'https://hermes.test', pretendToBeVisual: true })
   const w = dom.window
   Object.defineProperty(w, 'innerWidth', { value: viewport[0] }); Object.defineProperty(w, 'innerHeight', { value: viewport[1] })
   w.HTMLCanvasElement.prototype.getContext = () => ({ clearRect() {}, drawImage() {} })
   const atom = initial => { let value = initial; const listeners = new Set(); return { get: () => value, set: next => { value = next; for (const fn of listeners) fn(next) }, listen: fn => { listeners.add(fn); return () => listeners.delete(fn) } } }
-  const state = { focusedSessionId: atom(''), focusedStoredSessionId: atom(''), focusedSessionProfile: atom(''), focusedSessionOwner: atom(null), busyBySession: atom({}), connectionId: atom('local'), profile: atom('default') }
+  const state = { focusedSessionId: atom(''), focusedStoredSessionId: atom(''), focusedSessionProfile: atom(''), focusedSessionOwner: atom(null), busyBySession: atom({}), connectionId: atom(connection), profile: atom('default') }
+  if (bridge) w.hermesDesktop = { api: bridge }
   const opened = [], notes = [], calls = [], said = [], cleared = []
   const host = { state, openSession: async (id, options) => opened.push({ id, options }), onEvent: () => () => {}, notify: note => notes.push(note),
     request: async method => method === 'profiles.list' ? (roster || { profiles: [{ name: 'alpha', display_name: 'Alpha', canonical_session: { id: 'chat-a' } }] }) : {} }
   const feed = { progress }
+  const feedState = { failBots: false }  // simulate a backend whose pet routes refuse this client
   const rest = async (path, options = {}) => {
     calls.push({ path, body: options.body })
     if (path === '/companion/capabilities') return { desktopWindows, platform: desktopWindows ? 'linux' : 'win32', reason: '' }
+    if (path === '/companion/bots' && feedState.failBots) throw new Error('403 Forbidden')
     if (path === '/companion/bots') return { bots: Object.fromEntries(options.body.bots.map(name => [name, { avatarId: ID('a'), pet: { spriteId: ID('b'), frameWidth: 192, frameHeight: 208, counts: [6,8,8,4,5,8,6,6,6], top: 20 }, ...(feed.progress ? { progress: feed.progress } : {}) }])) }
     if (path === '/companion/image') return { data: IMAGES[options.body.id] }
+    if (path === '/companion/pet-sprite') {
+      if (failPetSprite) throw new Error('404 Not Found')
+      if (hangPetSprite) return new Promise(() => {})
+      return { slug: 'demo', spriteId: ID('c'), sprite: IMAGES[ID('c')] }
+    }
     return {}
   }
   const sdk = { host, useValue: x => x?.get ? x.get() : x }
@@ -45,7 +53,7 @@ async function setup({ desktopWindows = false, store = {}, progress = null, rost
   await settle()
   const run = code => vm.runInContext(code, context)
   const botsOn = async () => { run('botTracker.setEnabled(true)'); await run('petCompanion.syncBots()'); await settle(10) }
-  return { w, run, calls, said, cleared, opened, notes, storage, feed, contributions, settle, botsOn,
+  return { w, run, calls, said, cleared, opened, notes, storage, feed, contributions, settle, botsOn, failBots: value => { feedState.failBots = !!value },
     pets: () => [...w.document.querySelectorAll('[data-talk-bot]')],
     cleanup: () => { disposers.splice(0).forEach(fn => fn()); w.close() } }
 }
@@ -226,5 +234,243 @@ test('bot lines in Hermes\u2019 pet bubble are off unless switched on', async ()
     await h.botsOn()
     assert.equal(h.pets().length, 1, 'bot pets still appear inside Hermes')
     assert.equal(h.said.length, 0, 'no pet.say lines by default')
+  } finally { h.cleanup() }
+})
+
+// A remote source (SSH host, remote gateway) is a normal source for bot pets: the backend that
+// answers the chat owns the profiles, so the pets still come from it — only the window changes.
+test('a remote backend draws bot pets inside Hermes even when its own system supports desktop windows', async () => {
+  const h = await setup({ desktopWindows: true })
+  try {
+    h.run("host.state.connectionId.set('hermes-thinkpad')")
+    await h.botsOn()
+    assert.equal(h.run('petBotsOnDesktop()'), false, 'no helper can be spawned on another machine')
+    assert.equal(h.pets().length, 1)
+    assert.equal(h.pets()[0].getAttribute('data-talk-bot'), 'alpha')
+    assert.ok(h.calls.some(c => c.path === '/companion/bots'))
+    assert.ok(!h.calls.some(c => c.path === '/companion/claim'))
+  } finally { h.cleanup() }
+})
+
+test('a backend that refuses the pet routes hides in-app pets instead of leaving empty boxes', async () => {
+  const h = await setup()
+  try {
+    await h.botsOn()
+    assert.equal(h.pets().length, 1)
+    h.failBots(true)
+    for (let n = 0; n < 3; n++) { h.w.dispatchEvent(new h.w.CustomEvent('talk-desktop:bots')); await h.settle(8) }
+    assert.equal(h.run('petCompanion.inappBlocked'), true)
+    assert.equal(h.pets().length, 0)
+    assert.equal(h.run('botTracker.enabled()'), true, 'the roster is kept, only the drawing stops')
+    h.failBots(false)
+    h.w.dispatchEvent(new h.w.CustomEvent('talk-desktop:bots')); await h.settle(8)
+    assert.equal(h.run('petCompanion.inappBlocked'), false)
+    assert.equal(h.pets().length, 1)
+  } finally { h.cleanup() }
+})
+
+// ── Hosted bot windows: a remote chat, windows drawn by this machine's backend ──────────────
+function hostBridge(log, { hostWindows = true, commands = [], servePetSheet = false } = {}) {
+  let pulsed = 0
+  return async request => {
+    log.push({ path: request.path, body: request.body })
+    if (request.path.endsWith('/companion/capabilities')) return { desktopWindows: hostWindows, rendererHost: true, platform: 'linux', reason: hostWindows ? '' : 'no compositor' }
+    if (request.path.endsWith('/companion/claim')) return { token: 'tok-1', generation: 'gen-1' }
+    if (request.path.endsWith('/companion/pulse')) {
+      const out = { generation: 'gen-1', commands: pulsed++ === 0 ? commands : [], helper: true }
+      return out
+    }
+    if (request.path.endsWith('/companion/launch')) return { running: true, ready: true }
+    if (request.path.endsWith('/companion/host/image')) return { ok: true }
+    if (request.path.endsWith('/companion/pet-sprite')) return servePetSheet ? { slug: 'local-pippa', spriteId: ID('c'), sprite: IMAGES[ID('c')] } : {}
+    return {}
+  }
+}
+
+test('a remote chat gets desktop bot windows hosted by this machine', async () => {
+  const log = []
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge: hostBridge(log, { commands: [{ id: 'cmd-1', action: 'botChat', bot: 'alpha' }] }) })
+  try {
+    await h.settle(8)
+    await h.botsOn()
+    for (let n = 0; n < 4; n++) { await h.settle(10); await new Promise(r => setTimeout(r, 5)) }
+    const claim = log.find(c => c.path.endsWith('/companion/claim'))
+    assert.equal(JSON.stringify(claim.body), JSON.stringify({ connection: 'hermes-thinkpad', profile: 'default', host: 'renderer' }))
+    assert.equal(h.run('petBotsOnDesktop()'), true, 'the remote chat renders on this machine')
+    assert.equal(h.pets().length, 0, 'nothing is drawn inside the Hermes window')
+    const pulses = log.filter(c => c.path.endsWith('/companion/pulse'))
+    assert.ok(pulses.length, 'the presentation is pushed to the local backend')
+    const state = pulses.at(-1).body.state
+    assert.equal(state.petVisible, false, 'no main pet for a remote chat')
+    assert.equal(state.bots[0].id, 'alpha')
+    assert.ok(state.bots[0].avatarId, 'images travel by id, uploaded once')
+    assert.ok(state.bots[0].pet?.spriteId)
+    const uploads = log.filter(c => c.path.endsWith('/companion/host/image')).map(c => c.body.id).sort()
+    assert.deepEqual(uploads, [ID('a'), ID('b')])
+    assert.ok(log.some(c => c.path.endsWith('/companion/launch')), 'the helper is launched once')
+    assert.ok(h.opened.some(o => o.id === 'chat-a'), 'a bot click opens the chat on its own connection')
+    assert.ok(log.some(c => (c.body?.acks || []).some(ack => ack.id === 'cmd-1')), 'the command is acknowledged')
+  } finally { h.cleanup() }
+})
+
+test('a remote chat falls back to in-window pets when this machine cannot host windows', async () => {
+  const log = []
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge: hostBridge(log, { hostWindows: false }) })
+  try {
+    await h.settle(8)
+    await h.botsOn()
+    assert.equal(h.run('petBotsOnDesktop()'), false)
+    assert.equal(h.pets().length, 1)
+    assert.ok(!log.some(c => c.path.endsWith('/companion/claim')), 'no lease is taken when the local half cannot host')
+  } finally { h.cleanup() }
+})
+
+test('choosing Inside Hermes on a remote chat never takes a host lease', async () => {
+  const log = []
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', store: { 'botPlacement.v1': 'inapp' }, bridge: hostBridge(log) })
+  try {
+    await h.settle(8)
+    await h.botsOn()
+    assert.equal(h.run('petBotsOnDesktop()'), false)
+    assert.equal(h.pets().length, 1)
+    assert.ok(!log.some(c => c.path.endsWith('/companion/claim')))
+  } finally { h.cleanup() }
+})
+
+test('an older local backend that cannot host renderer leases keeps bot pets inside Hermes', async () => {
+  const log = []
+  const bridge = async request => {
+    log.push({ path: request.path, body: request.body })
+    if (request.path.endsWith('/companion/capabilities')) return { desktopWindows: true, platform: 'linux', reason: '' }  // no rendererHost
+    return {}
+  }
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge })
+  try {
+    await h.settle(8)
+    await h.botsOn()
+    assert.equal(h.run('petBotsOnDesktop()'), false, 'no host lease without the negotiated flag')
+    assert.equal(h.pets().length, 1)
+    assert.ok(!log.some(c => c.path.endsWith('/companion/claim')))
+  } finally { h.cleanup() }
+})
+
+test('a remote chat also pops the main pet out through this machine', async () => {
+  const log = []
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge: hostBridge(log, { commands: [{ id: 'cmd-bots', action: 'bots' }] }) })
+  try {
+    await h.settle(8)
+    await h.botsOn()
+    h.run('petCompanion.wantPopOut = true')
+    h.w.dispatchEvent(new h.w.CustomEvent('talk-desktop:bots'))
+    for (let n = 0; n < 5; n++) { await h.settle(10); await new Promise(r => setTimeout(r, 5)) }
+    assert.equal(h.run('petCompanion.open'), true, 'the launch reply marks the window as up')
+    const last = log.filter(c => c.path.endsWith('/companion/pulse')).at(-1).body.state
+    assert.equal(last.petVisible, true, 'the hosted window shows the main pet')
+    assert.equal(last.pet?.spriteId, ID('c'), 'using the sheet the chat backend resolved')
+    assert.equal(last.descriptor?.controls?.length, 4, 'the pop-out keeps its controls')
+    assert.ok(log.some(c => c.path.endsWith('/companion/host/image') && c.body.id === ID('c')), 'the sheet is uploaded once')
+    assert.equal(h.run('botTracker.enabled()'), false, 'a non-bot command drives the real controller')
+    assert.ok(log.some(c => (c.body?.acks || []).some(a => a.id === 'cmd-bots' && a.ok)))
+    assert.equal(h.pets().length, 0, 'the in-app pet is hidden while popped out')
+  } finally { h.cleanup() }
+})
+
+test('an image this backend refuses is not retried on every poll', async () => {
+  const log = []
+  const bridge = async request => {
+    log.push({ path: request.path, body: request.body })
+    if (request.path.endsWith('/companion/capabilities')) return { desktopWindows: true, rendererHost: true }
+    if (request.path.endsWith('/companion/claim')) return { token: 't', generation: 'g' }
+    if (request.path.endsWith('/companion/pulse')) return { generation: 'g', commands: [], helper: true }
+    if (request.path.endsWith('/companion/launch')) return { running: true }
+    if (request.path.endsWith('/companion/host/image')) throw new Error('413 Image too large')
+    return {}
+  }
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge })
+  try {
+    await h.settle(8); await h.botsOn()
+    for (let n = 0; n < 6; n++) { await h.settle(10); await new Promise(r => setTimeout(r, 5)) }
+    const uploads = log.filter(c => c.path.endsWith('/companion/host/image')).map(c => c.body.id).sort()
+    assert.deepEqual(uploads, [ID('a'), ID('b')], 'one attempt per id, then it waits for a route change')
+  } finally { h.cleanup() }
+})
+
+test('a hosted pop-out that cannot open gives the in-app pet back', async () => {
+  const bridge = async request => {
+    if (request.path.endsWith('/companion/capabilities')) return { desktopWindows: true, rendererHost: true }
+    if (request.path.endsWith('/companion/claim')) throw new Error('409 Companion already has an owner')
+    if (request.path.endsWith('/companion/pulse')) return { generation: 'g', commands: [], helper: false }
+    return {}
+  }
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge })
+  try {
+    await h.settle(8); await h.botsOn()
+    h.run('petCompanion.open = true')
+    h.w.dispatchEvent(new h.w.CustomEvent('talk-desktop:bots'))
+    for (let n = 0; n < 8; n++) { await h.settle(10); await new Promise(r => setTimeout(r, 5)) }
+    assert.equal(h.run('petCompanion.open'), false, 'the in-app pet is released when no window opened')
+  } finally { h.cleanup() }
+})
+
+test('a backend without the pet sheet route reports it instead of throwing', async () => {
+  const log = []
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge: hostBridge(log), failPetSprite: true })
+  try {
+    await h.settle(8)
+    h.run('petCompanion.wantPopOut = true')
+    h.w.dispatchEvent(new h.w.CustomEvent('talk-desktop:bots'))
+    for (let n = 0; n < 5; n++) { await h.settle(10); await new Promise(r => setTimeout(r, 5)) }
+    assert.match(String(h.run('petCompanion.error')), /restart Hermes/, 'the missing route is named')
+    assert.equal(h.run('petCompanion.open'), false, 'no empty window is left open')
+    assert.ok(!log.some(c => c.path.endsWith('/companion/pulse')), 'nothing is published without a sheet')
+  } finally { h.cleanup() }
+})
+
+test('a sheet request that never answers does not hide the pet or wedge the loop', async () => {
+  const log = []
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge: hostBridge(log), hangPetSprite: true })
+  try {
+    await h.settle(8)
+    h.run('HOST_FETCH_MS = 60')
+    h.run('petCompanion.wantPopOut = true')
+    h.w.dispatchEvent(new h.w.CustomEvent('talk-desktop:bots'))
+    for (let n = 0; n < 12; n++) { await h.settle(10); await new Promise(r => setTimeout(r, 15)) }
+    assert.equal(h.run('petCompanion.open'), false, 'no window means the in-app pet stays')
+    assert.equal(h.run('petCompanion.wantPopOut'), false, 'the intent is dropped, not left pending')
+    assert.match(String(h.run('petCompanion.error')), /restart Hermes/)
+  } finally { h.cleanup() }
+})
+
+test('a load-time host probe miss is retried when the pop-out is asked for', async () => {
+  let calls = 0
+  const bridge = async request => {
+    if (request.path.endsWith('/companion/capabilities')) {
+      calls += 1
+      if (calls === 1) throw new Error('backend not ready')
+      return { desktopWindows: true, rendererHost: true }
+    }
+    return {}
+  }
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge })
+  try {
+    await h.settle(8)
+    assert.equal(h.run('petCompanion.hostWindows'), false, 'the first miss is not final')
+    assert.equal(await h.run('probeHostWindows()'), true, 'asking again finds the backend')
+    assert.equal(h.run('petCompanion.hostWindows'), true)
+  } finally { h.cleanup() }
+})
+
+test('when the chat backend has no sheet route the local copy is used', async () => {
+  const log = []
+  const h = await setup({ desktopWindows: true, connection: 'hermes-thinkpad', bridge: hostBridge(log, { servePetSheet: true }), failPetSprite: true })
+  try {
+    await h.settle(8)
+    h.run('petCompanion.wantPopOut = true')
+    h.w.dispatchEvent(new h.w.CustomEvent('talk-desktop:bots'))
+    for (let n = 0; n < 6; n++) { await h.settle(10); await new Promise(r => setTimeout(r, 5)) }
+    assert.equal(h.run('petCompanion.open'), true, 'the window opens with this machine\'s artwork')
+    const state = log.filter(c => c.path.endsWith('/companion/pulse')).at(-1).body.state
+    assert.equal(state.pet?.spriteId, ID('c'))
+    assert.ok(log.some(c => c.body?.id === ID('c')), 'the sheet was uploaded once')
   } finally { h.cleanup() }
 })

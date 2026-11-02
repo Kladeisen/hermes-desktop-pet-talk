@@ -35,7 +35,33 @@ portable = gallery.portable  # shared cross-platform helpers (dashboard/portable
 ACTIONS = {'start', 'stop', 'setMuted', 'chat', 'transcript', 'reply', 'bots', 'hidePet', 'botChat', 'botDismiss'}
 MAX_REPLY = 500
 MAX_BODY = 16384
+# A renderer-hosted sheet or avatar arrives once per id, base64-inflated: one image per request,
+# and the cap covers a full 8 MiB sheet (4/3 inflation plus JSON overhead) while the pulse path
+# keeps its small cap.
+MAX_IMAGE_BODY = 11_500_000
 LEASE_SECONDS = 8
+
+def wayland_display():
+    """Compositor socket name: the env var when set, else this session's own socket.
+
+    The app can spawn a pooled backend without WAYLAND_DISPLAY; the socket in XDG_RUNTIME_DIR
+    still exists, and that is all a layer-shell window actually needs.
+    """
+    current = os.environ.get('WAYLAND_DISPLAY')
+    if current:
+        return current
+    runtime = os.environ.get('XDG_RUNTIME_DIR')
+    if not runtime or not os.path.isdir(runtime):
+        return ''
+    try:
+        names = sorted(os.listdir(runtime))
+    except OSError:
+        return ''
+    for name in names:
+        if name.startswith('wayland-') and not name.endswith('.lock'):
+            return name
+    return ''
+
 
 def clean_label(value):
     """Same rule as petBotLabel in desktop/plugin.js: odd spaces become one space, other invisible
@@ -107,15 +133,22 @@ class Broker:
             self.fail(400, 'Unknown bot profile')
         return path
 
-    def sanitize_bots(self, bots):
+    def sanitize_bots(self, bots, hosted=False):
         if not isinstance(bots, list) or len(bots) > 12:
             self.fail(400, 'Invalid bot roster')
         result, seen = [], set()
+        allowed = {'id','label','status','chat','attention'} | ({'avatarId','pet'} if hosted else set())
         for bot in bots:
-            if not isinstance(bot, dict) or set(bot) - {'id','label','status','chat','attention'}:
+            if not isinstance(bot, dict) or set(bot) - allowed:
                 self.fail(400, 'Invalid bot fields')
             name = bot.get('id')
-            self.profile_dir(name)
+            # A hosted roster names profiles of the chat's own backend, so it cannot be checked
+            # against this machine's profile folders; the identity rule is the same either way.
+            if hosted:
+                if not isinstance(name, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name):
+                    self.fail(400, 'Invalid bot identity')
+            else:
+                self.profile_dir(name)
             if name in seen:
                 self.fail(400, 'Duplicate bot identity')
             seen.add(name)
@@ -128,6 +161,14 @@ class Broker:
                 if not isinstance(attention, dict) or set(attention) != {'kind','count'} or attention.get('kind') not in ('approval','clarify','sudo') or type(attention.get('count')) is not int or not 1 <= attention['count'] <= 16:
                     self.fail(400, 'Invalid bot attention')
                 clean['attention'] = attention.copy()
+            if hosted:
+                avatar = bot.get('avatarId')
+                if avatar is not None:
+                    if not isinstance(avatar, str) or not re.fullmatch(r'[0-9a-f]{64}', avatar) or avatar not in (getattr(self, '_sprites', None) or {}):
+                        self.fail(400, 'Unknown bot avatar')
+                    clean['avatarId'] = avatar
+                if bot.get('pet') is not None:
+                    clean['pet'] = self.hosted_pet(bot['pet'])
             result.append(clean)
         return result
 
@@ -168,11 +209,75 @@ class Broker:
             self.expire()
             if self.owner:
                 self.fail(409, 'Companion already has an owner')
-            if data.get('connection') != 'local' or not isinstance(data.get('profile'), str) or not data['profile'] or len(data['profile']) > 64:
+            if not isinstance(data, dict) or set(data) - {'connection', 'profile', 'host'}:
+                self.fail(400, 'Invalid owner request')
+            host = data.get('host') or 'backend'
+            if host not in ('backend', 'renderer'):
+                self.fail(400, 'Unknown owner host')
+            if not isinstance(data.get('profile'), str) or not data['profile'] or len(data['profile']) > 64:
+                self.fail(403, 'Companion requires a verified owner route')
+            connection = data.get('connection')
+            if host == 'renderer':
+                # The renderer hosts these windows on THIS machine for a chat that lives on another
+                # connection: it supplies the roster and images, so no local profile is resolved.
+                if not isinstance(connection, str) or connection == 'local' or not re.fullmatch(r'[A-Za-z0-9:_\-.]{1,64}', connection):
+                    self.fail(403, 'Renderer host requires a remote connection id')
+            elif connection != 'local':
                 self.fail(403, 'Companion requires a verified local owner route')
             self.closed.clear()
-            self.owner = {'token': secrets.token_urlsafe(32), 'generation': secrets.token_urlsafe(18), 'profile': data['profile'], 'connection': 'local', 'pulse': self.clock()}
+            self.owner = {'token': secrets.token_urlsafe(32), 'generation': secrets.token_urlsafe(18),
+                          'profile': data['profile'], 'connection': 'local' if host == 'backend' else connection,
+                          'host': host, 'pulse': self.clock()}
             return {key:self.owner[key] for key in ('token','generation')}
+
+    def hosted(self):
+        """True when the renderer owns this lease's presentation (windows for a remote chat)."""
+        return bool(self.owner and self.owner.get('host') == 'renderer')
+
+    def host_image(self, data):
+        """One renderer-supplied avatar or sheet for a remote chat: bounded, id-addressed, cached."""
+        with self.lock:
+            self.expire()
+            if not isinstance(data, dict):
+                self.fail(400, 'Invalid image upload')
+            self.authenticate(data)
+            if set(data) - {'token', 'generation', 'id', 'data'}:
+                self.fail(400, 'Invalid image upload')
+            ident, image = data.get('id'), data.get('data')
+            if not isinstance(ident, str) or not re.fullmatch(r'[0-9a-f]{64}', ident):
+                self.fail(400, 'Invalid image id')
+            if not isinstance(image, str) or not image.startswith(('data:image/png;base64,', 'data:image/webp;base64,', 'data:image/jpeg;base64,')):
+                self.fail(400, 'Invalid image data')
+            if len(image) > MAX_IMAGE_BODY:
+                self.fail(413, 'Image too large')
+            self.remember_known(ident, image)
+            return {'ok': True, 'id': ident}
+
+    def remember_known(self, ident, data):
+        images = getattr(self, '_sprites', None)
+        if images is None:
+            images = self._sprites = collections.OrderedDict()
+        images[ident] = data
+        images.move_to_end(ident)
+        while len(images) > 64:
+            images.popitem(last=False)
+
+    def hosted_pet(self, pet):
+        """Validate a bot sprite descriptor the renderer took from the chat's own backend."""
+        if not isinstance(pet, dict) or set(pet) - {'spriteId', 'frameWidth', 'frameHeight', 'counts', 'top'}:
+            self.fail(400, 'Invalid bot sprite')
+        ident = pet.get('spriteId')
+        if not isinstance(ident, str) or not re.fullmatch(r'[0-9a-f]{64}', ident) or ident not in (getattr(self, '_sprites', None) or {}):
+            self.fail(400, 'Unknown bot sprite')
+        width, height = pet.get('frameWidth'), pet.get('frameHeight')
+        counts, top = pet.get('counts'), pet.get('top', 0)
+        if type(width) is not int or type(height) is not int or not 8 <= width <= 512 or not 8 <= height <= 512:
+            self.fail(400, 'Invalid sprite frame')
+        if not isinstance(counts, list) or not 1 <= len(counts) <= 32 or any(type(n) is not int or not 1 <= n <= 64 for n in counts):
+            self.fail(400, 'Invalid sprite counts')
+        if type(top) is not int or not 0 <= top <= height:
+            self.fail(400, 'Invalid sprite inset')
+        return {'spriteId': ident, 'frameWidth': width, 'frameHeight': height, 'counts': list(counts), 'top': top}
 
     def authenticate(self, data):
         self.expire()
@@ -182,7 +287,7 @@ class Broker:
             self.fail(409, 'Stale owner generation')
 
     def sanitize(self, state):
-        if not isinstance(state, dict) or set(state) - {'descriptor','lifecycle','status','muted','bands','capabilities','theme','owner','narration','attention','bots','botsEnabled','petVisible','petSize','botSize','botReset'}:
+        if not isinstance(state, dict) or set(state) - {'descriptor','lifecycle','status','muted','bands','capabilities','theme','owner','narration','attention','bots','botsEnabled','petVisible','petSize','botSize','botReset','pet'}:
             self.fail(400, 'Unsupported presentation field')
         life = state.get('lifecycle')
         if life not in {'idle','connecting','connected','error'}:
@@ -209,7 +314,15 @@ class Broker:
                     self.fail(400, 'Invalid pet size')
                 result[key] = state[key]
         if 'bots' in state:
-            result['bots'] = self.sanitize_bots(state['bots'])
+            result['bots'] = self.sanitize_bots(state['bots'], hosted=self.hosted())
+        if 'pet' in state:
+            # Hosted windows draw the chat's own pet: the renderer uploaded that sheet here.
+            if not self.hosted():
+                self.fail(400, 'Unexpected pet sheet')
+            pet = state['pet']
+            if not isinstance(pet, dict) or set(pet) != {'spriteId'} or pet.get('spriteId') not in (getattr(self, '_sprites', None) or {}):
+                self.fail(400, 'Unknown pet sheet')
+            result['pet'] = {'spriteId': pet['spriteId']}
         narration = state.get('narration')
         if narration is not None:
             if not isinstance(narration,dict) or set(narration)-{'text','tone','until'} or not isinstance(narration.get('text'),str) or len(narration['text'])>120 or narration.get('tone') not in {'info','wait','error'} or type(narration.get('until')) not in (int,float) or not math.isfinite(narration['until']):
@@ -254,7 +367,8 @@ class Broker:
         if target:
             if not isinstance(target,dict) or set(target)-{'runtimeId','storedId','profile','connection'} or any(not isinstance(v,str) or len(v)>200 for v in target.values()):
                 self.fail(400, 'Invalid chat owner')
-            if target.get('connection') != 'local' or target.get('profile') != self.owner['profile']:
+            expected = self.owner['connection'] if self.hosted() else 'local'
+            if target.get('connection') != expected or target.get('profile') != self.owner['profile']:
                 self.fail(409, 'Owner route changed')
             result['owner'] = target
         return result
@@ -294,7 +408,8 @@ class Broker:
                 bot = next((b for b in self.state.get('bots',[]) if b['id'] == data.get('bot')), None)
                 if not bot or (data['action'] == 'botChat' and not bot['chat']):
                     self.fail(409, 'Bot action unavailable')
-                self.profile_dir(bot['id'])
+                if not self.hosted():
+                    self.profile_dir(bot['id'])
             elif 'bot' in data:
                 self.fail(400, 'Unexpected bot identity')
             if data.get('action') == 'reply':
@@ -373,7 +488,10 @@ class Broker:
 
     def owner_home(self):
         """Hermes home of the owner's profile: the root for default, else profiles/<name>."""
-        profile = (self.owner or {}).get('profile') or 'default'
+        return self.profile_home((self.owner or {}).get('profile') or 'default')
+
+    def profile_home(self, profile):
+        """Hermes home of one profile of THIS machine (default is the root itself)."""
         root = self.profiles_root().parent
         if profile == 'default':
             return root
@@ -381,6 +499,28 @@ class Broker:
             return self.profile_dir(profile)
         except HTTPException:
             return None
+
+    def pet_sheet(self, profile):
+        """The sheet Hermes would show for that profile here, so another machine can draw it.
+
+        A renderer hosting windows for a chat on this backend asks for it by profile; the same
+        validation as the pop-out applies, and the id lets the caller fetch the bytes once.
+        """
+        if not isinstance(profile, str) or not profile or len(profile) > 64:
+            self.fail(400, 'Invalid profile')
+        home = self.profile_home(profile)
+        slug, where = gallery.active_pet_source(home) if home else (None, None)
+        if not where:
+            self.fail(404, 'No pet installed for that profile')
+        data = gallery._read_regular(where[0], where[1], gallery.MAX_SHEET_BYTES)
+        if not data:
+            self.fail(404, 'Pet sheet unavailable')
+        sheet = main_sheet(data)
+        if not sheet:
+            self.fail(422, 'Pet sheet is not a usable sprite grid')
+        ident = hashlib.sha256(sheet['sprite'].encode('ascii')).hexdigest()
+        self.remember_known(ident, sheet['sprite'])
+        return {'slug': slug, 'spriteId': ident, 'sprite': sheet['sprite']}
 
     def main_pet(self):
         """The pet the user selected in Hermes, for the pop-out (re-checked every ~2 s).
@@ -424,6 +564,20 @@ class Broker:
 
     def helper_state(self):
         state = dict(self.state or {})
+        if self.hosted():
+            # Windows for a chat on another connection: the renderer supplied the roster and the
+            # images, so resolve nothing from this machine's profiles and draw no main pet.
+            bots = []
+            for bot in state.get('bots', []):
+                entry = {key: value for key, value in bot.items() if key not in ('avatarId', 'pet')}
+                avatar = (getattr(self, '_sprites', None) or {}).get(bot.get('avatarId') or '')
+                if avatar:
+                    entry['avatar'] = avatar
+                if bot.get('pet'):
+                    entry['pet'] = dict(bot['pet'])
+                bots.append(entry)
+            state['bots'] = bots
+            return {'generation': self.owner['generation'], 'state': state, 'acks': dict(self.done)}
         bots = []
         progress = self.progress([bot['id'] for bot in state.get('bots', [])]) if state.get('bots') else {}
         def by_id(pet):
@@ -483,13 +637,15 @@ class Broker:
     @staticmethod
     def capabilities():
         """Whether this backend can open the plugin's own desktop pet windows."""
+        # rendererHost: this build also hosts windows for a chat on ANOTHER connection, so a
+        # renderer may claim with host 'renderer'. Older builds omit it and get the in-window pets.
         if not sys.platform.startswith('linux'):
-            return {'desktopWindows': False, 'platform': sys.platform, 'reason': 'Desktop pet windows are Linux-only for now'}
-        if not os.environ.get('WAYLAND_DISPLAY'):
-            return {'desktopWindows': False, 'platform': sys.platform, 'reason': 'Desktop pet windows need a Wayland layer-shell compositor'}
+            return {'desktopWindows': False, 'rendererHost': True, 'platform': sys.platform, 'reason': 'Desktop pet windows are Linux-only for now'}
+        if not wayland_display():
+            return {'desktopWindows': False, 'rendererHost': True, 'platform': sys.platform, 'reason': 'Desktop pet windows need a Wayland layer-shell compositor'}
         if not os.path.exists('/usr/bin/python'):
-            return {'desktopWindows': False, 'platform': sys.platform, 'reason': 'Desktop pet windows need the system Python with GTK'}
-        return {'desktopWindows': True, 'platform': sys.platform, 'reason': ''}
+            return {'desktopWindows': False, 'rendererHost': True, 'platform': sys.platform, 'reason': 'Desktop pet windows need the system Python with GTK'}
+        return {'desktopWindows': True, 'rendererHost': True, 'platform': sys.platform, 'reason': ''}
 
     def sprite_data(self, data):
         if not isinstance(data, dict) or set(data) != {'id'} or not isinstance(data['id'], str) or not re.fullmatch(r'[0-9a-f]{64}', data['id']):
@@ -515,11 +671,12 @@ class Broker:
     def runtime(self):
         if not sys.platform.startswith('linux'):
             self.fail(503,'Desktop pop-out windows are Linux-only for now; shift-click the pet for Hermes\' own pop-out')
-        if not os.environ.get('WAYLAND_DISPLAY'):
+        display = wayland_display()
+        if not display:
             self.fail(503,'The pop-out pet currently requires Linux Wayland layer-shell')
         allowed={'HOME','USER','LOGNAME','LANG','LC_ALL','DISPLAY','WAYLAND_DISPLAY','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS','XDG_SESSION_TYPE','XAUTHORITY','GDK_SCALE','GDK_DPI_SCALE','GTK_THEME','XDG_DATA_DIRS','XDG_CONFIG_HOME','XDG_CACHE_HOME','HYPRLAND_INSTANCE_SIGNATURE'}
         env={k:v for k,v in os.environ.items() if k in allowed}
-        env.update({'PATH':'/usr/bin:/bin','GDK_BACKEND':'wayland'})
+        env.update({'PATH':'/usr/bin:/bin','GDK_BACKEND':'wayland','WAYLAND_DISPLAY':display})
         try:
             check = subprocess.run(['/usr/bin/python',str(self.root/'companion'/'native_helper.py'),'--check'],env=env,capture_output=True,text=True,timeout=10)
         except (OSError,subprocess.TimeoutExpired):
@@ -624,7 +781,7 @@ class Broker:
 
 def make_router(broker):
     router=APIRouter()
-    async def body(request):
+    async def body(request, limit=MAX_BODY, message='Presentation too large'):
         try:
             if not request.client or not ipaddress.ip_address(request.client.host).is_loopback:
                 broker.fail(403,'The pop-out pet can only launch on the local backend')
@@ -632,7 +789,7 @@ def make_router(broker):
         if request.headers.get('origin'):
             broker.fail(403,'Owner API requires the native Hermes REST transport')
         raw=await request.body()
-        if len(raw)>MAX_BODY: broker.fail(413,'Presentation too large')
+        if len(raw)>limit: broker.fail(413, message)
         try:
             data=json.loads(raw)
             if not isinstance(data,dict): raise ValueError()
@@ -663,6 +820,18 @@ def make_router(broker):
         import asyncio
         data=await body(request)
         return {'bots': await asyncio.to_thread(broker.inapp_bots, data.get('bots'))}
+    @router.post('/companion/pet-sprite')
+    async def pet_sprite(request:Request):
+        # The sheet Hermes shows for one profile of THIS backend, so a renderer on another
+        # machine can host that chat's pop-out. Text plus one data URI; no lease required.
+        import asyncio
+        data=await body(request)
+        if set(data)!={'profile'}: broker.fail(400,'Invalid pet request')
+        return await asyncio.to_thread(broker.pet_sheet, data['profile'])
+    @router.post('/companion/host/image')
+    async def host_image(request:Request):
+        # One renderer-supplied avatar/sheet for a remote chat's bot windows.
+        return broker.host_image(await body(request, MAX_IMAGE_BODY, 'Image too large'))
     @router.post('/companion/image')
     async def image(request:Request):
         data=await body(request)

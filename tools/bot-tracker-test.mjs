@@ -323,13 +323,18 @@ test('disabled tracker rejects a pending roster reply', async () => {
 })
 
 test('connection changes invalidate pending discovery and active turns', async () => {
-  let resolve
-  const f = fixture(() => new Promise(r => { resolve = r }))
+  const pending = []
+  const f = fixture(() => new Promise(resolve => pending.push(resolve)))
   f.tracker.setEnabled(true)
   f.connect('remote')
-  resolve({profiles:[{name:'alpha'}]})
+  // The old connection's reply arrives after the switch: dropped, not applied to the new route.
+  pending[0]({profiles:[{name:'alpha'}]})
   await Promise.resolve(); await Promise.resolve()
   assert.deepEqual(f.tracker.bots(), [])
+  // The new connection discovers normally; a remote source is a source, not "no pets".
+  pending[1]({profiles:[{name:'alpha'}]})
+  await Promise.resolve(); await Promise.resolve()
+  assert.deepEqual(f.tracker.bots().map(bot => bot.id), ['alpha'])
   f.tracker.dispose()
 })
 test('toggle cycle starts fresh discovery while the old request is pending', async () => {
@@ -400,5 +405,35 @@ test('bot status report still works when the sprite check fails', async () => {
   try {
     f.tracker.setEnabled(true); await f.tracker.report()
     assert.match(f.notes.at(-1).message, /alpha: Idle · beta: Idle/)
+  } finally { f.tracker.dispose() }
+})
+
+// Bot pets follow the source the app is on: an SSH host or remote gateway is a normal source, and
+// its own stamps are accepted while any other connection's stay foreign.
+test('a remote connection discovers bots and follows only its own event stamps', async () => {
+  const f = fixture()
+  try {
+    f.connect('hermes-thinkpad')
+    f.tracker.setEnabled(true); await f.tracker.refresh(); await Promise.resolve()
+    assert.equal(f.tracker.bots().length, 2)
+    assert.deepEqual([f.tracker.diagnostics().connection, f.tracker.diagnostics().local], ['hermes-thinkpad', false])
+    f.event('message.start', { profile: 'alpha', connectionId: 'hermes-thinkpad', session_id: 'runtime-alpha' })
+    assert.equal(f.tracker.bots()[0].status, 'Working')
+    // The local connection is a different source: its stamps fail closed here too.
+    f.event('message.complete', { profile: 'alpha', connectionId: 'local', session_id: 'runtime-alpha', payload: { status: 'complete' } })
+    assert.equal(f.tracker.bots()[0].status, 'Working')
+    assert.equal(f.tracker.diagnostics().events['terminal:foreign-connection'], 1)
+    f.event('message.complete', { profile: 'alpha', connectionId: 'hermes-thinkpad', session_id: 'runtime-alpha', payload: { status: 'complete' } })
+    assert.equal(f.tracker.bots()[0].status, 'Finished')
+  } finally { f.tracker.dispose() }
+})
+
+test('bot chat opens on the connection its pets came from', async () => {
+  const f = fixture()
+  try {
+    f.connect('hermes-thinkpad')
+    f.tracker.setEnabled(true); await f.tracker.refresh(); await Promise.resolve()
+    assert.deepEqual(await f.tracker.openChat('alpha'),
+      ['a', { profile: 'alpha', intent: 'in-place', route: { connectionId: 'hermes-thinkpad', profile: 'alpha', mode: 'remote' } }])
   } finally { f.tracker.dispose() }
 })
